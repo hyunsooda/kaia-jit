@@ -22,16 +22,54 @@
 
 package vm
 
+/*
+#cgo LDFLAGS: ${SRCDIR}/../../kaiax/jit_engine/target/release/libjit_engine.a -ldl -lm -lpthread
+#include <stdlib.h>
+#include <stdint.h>
+
+void* new_jit_engine();
+uint8_t* compile_add_func(void* engine);
+void free_jit_engine(void* engine);
+
+// Trampoline
+typedef long long (*binary_op_t)(long long, long long);
+
+long long execute_jit_func_test(void* func_ptr, long long a, long long b) {
+    binary_op_t f = (binary_op_t)func_ptr;
+    return f(a, b);
+}
+
+
+
+// (참고: 실행 함수 타입을 내부적으로 정의)
+typedef void (*jit_generated_func_t)(uint64_t* stack_base);
+
+static void execute_jit_func(void* func_ptr, void* stack_base) {
+    jit_generated_func_t jit_fn = (jit_generated_func_t)func_ptr;
+    jit_fn((uint64_t*)stack_base);
+}
+*/
+import "C"
+
 import (
 	"fmt"
 	"hash"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
+	"github.com/holiman/uint256"
+	"github.com/kaiachain/kaia/blockchain/vm/jit"
 	"github.com/kaiachain/kaia/common"
 	"github.com/kaiachain/kaia/common/math"
 	"github.com/kaiachain/kaia/kerrors"
 	"github.com/kaiachain/kaia/params"
+)
+
+var (
+	JIT_ENGINE unsafe.Pointer
+	HOT_FUNC   *C.uint8_t
 )
 
 // Config are the configuration options for the Interpreter
@@ -94,6 +132,17 @@ type EVMInterpreter struct {
 
 	readOnly   bool   // Whether to throw on stateful modifications
 	returnData []byte // Last CALL's return data for subsequent reuse
+
+	jitEngine unsafe.Pointer // Rust JIT 엔진 포인터 (void*)
+	jitOnce   sync.Once      // 스레드 안전한 초기화 보장
+}
+
+// initJitEngine: 최초 1회만 실행됨
+func (in *EVMInterpreter) initJitEngine() {
+	in.jitOnce.Do(func() {
+		// Rust의 new_jit_engine 호출
+		in.jitEngine = C.new_jit_engine()
+	})
 }
 
 // NewEVMInterpreter returns a new instance of the Interpreter.
@@ -220,6 +269,30 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err
 		}()
 	}
 
+	// if JIT_ENGINE == nil {
+	// 	JIT_ENGINE = C.new_jit_engine()
+	// }
+	// if HOT_FUNC == nil {
+	// 	HOT_FUNC = C.compile_add_func(JIT_ENGINE)
+	// }
+	// fmt.Println("🚀 Running JIT code...")
+	// jitResult := C.execute_jit_func_test(unsafe.Pointer(HOT_FUNC), 10, 20)
+	// fmt.Printf("Result: %d\n", jitResult)
+
+	{
+		if *contract.CodeAddr == common.HexToAddress("0x5dDeE20Ddf85CDc5837951653395B6015B926666") {
+
+			trajs := jit.AnalyzeTrace(contract.Code, pc)
+			for pc, traj := range trajs {
+				totalLen := uint64(0)
+				for _, s := range traj.Segments {
+					totalLen += s.Length
+				}
+				fmt.Println("@@@", pc, traj.CanJit, traj.TotalGas, totalLen)
+			}
+		}
+	}
+
 	// The Interpreter main run loop (contextual). This loop runs until either an
 	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
 	// the execution of one of the operations or until the done flag is set by the
@@ -330,4 +403,81 @@ func PrintOpCodeExecTime() {
 			logger.Info("op "+OpCode(i).String(), "cnt", opCnt[i], "avg", opTime[i]/opCnt[i])
 		}
 	}
+}
+
+func (in *EVMInterpreter) IsJitEngineInitialized() bool {
+	return in.jitEngine != nil
+}
+
+func (in *EVMInterpreter) GetJitEngine() unsafe.Pointer {
+	return in.jitEngine
+}
+
+// tryExecuteJit: JIT 실행을 시도하고, 성공 시 다음 PC와 true를 반환합니다.
+// 실패하거나 JIT 대상이 아니면 false를 반환하여 인터프리터가 수행하게 합니다.
+func (in *EVMInterpreter) tryExecuteJit(contract *Contract, stack *Stack, pc uint64) (uint64, bool) {
+	// 1. 엔진 초기화 (Lazy Init)
+	in.initJitEngine()
+	if in.jitEngine == nil {
+		return 0, false
+	}
+
+	// 2. 캐시 조회 (Get or Compile)
+	// getOrCompile은 내부적으로 캐시를 확인하고, 없으면 분석/컴파일 후 저장합니다.
+	jitData, ok := in.getOrCompile(contract, pc)
+	if !ok {
+		return 0, false // JIT 불가능한 코드
+	}
+
+	// 3-2: 스택 Underflow (MinStack)
+	// 예: PUSH 10 -> POP 20 인 경우, MinStack은 10임.
+	// 현재 스택이 10개 미만이면 실행 불가. (10개 이상이면 중간에 PUSH 덕분에 안전)
+	if stack.len() < jitData.MinStack {
+		return 0, false // JIT 거부 -> 인터프리터가 돌다가 에러 냄
+	}
+
+	// 3-3: 스택 Overflow (MaxStackGrowth)
+	if stack.len()+jitData.MaxStackGrowth > int(params.StackLimit) {
+		return 0, false
+	}
+
+	// 4. 가스 차감
+	if !contract.UseGas(jitData.TotalGas) {
+		return 0, false
+	}
+
+	// ---------------------------------------------------------
+	// [실행 단계] - 검증 통과했으므로 안전하게 실행
+	// ---------------------------------------------------------
+
+	// 1. 스택 메모리 안전 확보 (Stack Growth)
+	// JIT이 실행되면서 스택을 늘릴 때, cap이 부족하면 Crash가 나므로 미리 확보
+	currentStackLen := stack.len()
+	neededCap := currentStackLen + jitData.MaxStackGrowth
+
+	if neededCap > cap(stack.data) {
+		newCap := neededCap + 128 // 여유분 확보
+		newData := make([]uint256.Int, currentStackLen, newCap)
+		copy(newData, stack.data)
+		stack.data = newData
+	}
+
+	// 2. JIT 실행 (Execute via CGO)
+	// 분석이나 컴파일 과정 없이, 캐시된 '함수 포인터'를 바로 실행
+	stackBase := unsafe.Pointer(&stack.data[0])
+	C.execute_jit_func(
+		jitData.fnPtr,
+		stackBase,
+		// C.size_t(currentStackLen),
+	)
+
+	// 3. 상태 동기화 (State Sync)
+	// 스택의 '데이터'는 JIT이 이미 다 바꿨음. Go에게 '길이(len)'만 알려주면 됨.
+	newLen := currentStackLen + jitData.NetStackDelta
+
+	// in.stack.data 슬라이스 길이 조정
+	stack.data = stack.data[:newLen]
+
+	// 다음 실행할 PC 반환 (JIT이 처리한 블록 다음 위치)
+	return jitData.NextPC, true
 }

@@ -1,0 +1,15 @@
+[package]
+name = "jit_engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+#TODO: Bump up the Cranelift version to latest version
+[dependencies]
+cranelift = "0.108.0"
+cranelift-jit = "0.108.0"
+cranelift-module = "0.108.0"
+target-lexicon = "0.12.0"
+cranelift-native = "0.108.0" 
