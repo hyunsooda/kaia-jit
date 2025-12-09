@@ -94,7 +94,21 @@ func run(evm *EVM, contract *Contract, input []byte) ([]byte, error) {
 			return ret, err
 		}
 	}
+	// if *contract.CodeAddr == common.HexToAddress("0x786b81Eb450A26E8c3df0104478BA172f77003D1") {
+	// 	fmt.Println("@@@", hexutil.Encode(input))
+	// 	// evm.interpreter.PrepareJit(contract)
+	// 	// ReplaceWithJitTransformation(contract)
+	// 	// fmt.Println("REPLACED")
+	// }
 	return evm.interpreter.Run(contract, input)
+}
+
+func ReplaceWithJitTransformation(contract *Contract) {
+	if analyzedContracts[contract.CodeHash] {
+		if jitCompiledContracts[*contract.CodeAddr] != nil {
+			contract.Code = jitCompiledContracts[*contract.CodeAddr]
+		}
+	}
 }
 
 // BlockContext provides the EVM with auxiliary information. Once provided

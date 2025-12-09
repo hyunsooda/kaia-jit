@@ -74,6 +74,7 @@ func makeBenchConfig() *BenchConfig {
 func prepareInterpreterAndContract(code []byte) (*vm.EVMInterpreter, *vm.Contract) {
 	// runtime.go:Execute()
 	cfg := makeBenchConfig()
+	cfg.Origin = common.HexToAddress("0x123")
 	txContext := vm.TxContext{
 		Origin:   cfg.Origin,
 		GasPrice: cfg.GasPrice,

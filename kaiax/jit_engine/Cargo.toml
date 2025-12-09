@@ -1,0 +1,23 @@
+[package]
+name = "jit_engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+#TODO: Bump up the Cranelift version to latest version
+[dependencies]
+cranelift = "0.108.0"
+cranelift-jit = "0.108.0"
+cranelift-module = "0.108.0"
+target-lexicon = "0.12.0"
+cranelift-native = "0.108.0"
+ethnum = "1.5.2"
+capstone = "0.13.0"
+
+[profile.release]
+opt-level = 3       # 최고 수준 최적화
+lto = "fat"         # 전체 코드에 대해 링크 타임 최적화 (매우 중요)
+codegen-units = 1   # 병렬 컴파일 끄고, 하나의 덩어리로 최적화 (느리지만 빠름)
+panic = "abort"     # 패닉 시 Unwind 하지 않음 (코드 크기 감소, 속도 향상)

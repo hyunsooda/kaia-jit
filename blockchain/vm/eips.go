@@ -261,6 +261,25 @@ func enable3855(jt *JumpTable) {
 	}
 }
 
+func enableJitFlag(jt *JumpTable) {
+	jt[JIT_FLAG] = &operation{
+		execute:         opJit,
+		constantGas:     0,
+		minStack:        0,
+		maxStack:        maxStack(0, 100), // TODO: Fix the max stack with correct value
+		computationCost: 0,
+	}
+}
+
+func opJit(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+	nextPC, jitExecuted := interpreter.tryExecuteJitSimple(scope.Contract, scope.Stack, scope.Contract.Input, *pc)
+	if jitExecuted {
+		*pc = nextPC - 1
+		fmt.Println("JITEXECUTED", *pc)
+	}
+	return nil, nil
+}
+
 // opPush0 implements the PUSH0 opcode
 func opPush0(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
 	scope.Stack.push(new(uint256.Int))

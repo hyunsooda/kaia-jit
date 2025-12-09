@@ -58,3 +58,5 @@ tests/testdata
 contracts/cypress/credit.go
 
 tests/spec-tests/
+
+target
