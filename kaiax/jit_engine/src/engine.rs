@@ -1,10 +1,16 @@
 use crate::dump;
 use crate::runtime;
-use cranelift::prelude::*;
+use cranelift::{
+    codegen::verify_function,
+    prelude::{isa::TargetIsa, *},
+};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
-use std::collections::HashMap;
+use std::os::raw::c_char;
+use std::ptr;
 use std::slice;
+use std::sync::Arc;
+use std::{collections::HashMap, ffi::CString};
 
 // -----------------------------------------------------------------------------
 // Init & Structs
@@ -17,6 +23,7 @@ pub struct JitEngine {
     counter: u32,
     // Runtime 함수 ID 캐시 (매번 import 방지)
     funcs: HashMap<String, FuncId>,
+    isa: Arc<dyn TargetIsa>,
 }
 
 #[no_mangle]
@@ -32,7 +39,7 @@ pub extern "C" fn new_jit_engine() -> *mut JitEngine {
         .finish(settings::Flags::new(flag_builder))
         .unwrap();
 
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
 
     // [핵심] Host Function 주소 등록 (Symbol Lookup)
     // JIT 코드가 "jit_add"를 호출하면 -> 실제 runtime.rs의 jit_add 주소로 연결
@@ -79,6 +86,7 @@ pub extern "C" fn new_jit_engine() -> *mut JitEngine {
         module,
         counter: 0,
         funcs: HashMap::new(),
+        isa,
     };
 
     Box::into_raw(Box::new(engine))
@@ -90,6 +98,16 @@ pub extern "C" fn free_jit_engine(ptr: *mut JitEngine) {
         unsafe {
             let _ = Box::from_raw(ptr);
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn free_error_msg(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = CString::from_raw(s);
     }
 }
 
@@ -218,6 +236,7 @@ fn get_func_1(module: &mut JITModule, funcs: &mut HashMap<String, FuncId>, name:
 #[no_mangle]
 pub extern "C" fn compile_trace(
     ptr: *mut JitEngine,
+    err_out: *mut *mut c_char,
     code_ptr: *const u8,
     pc_map_ptr: *const u64,
     len: usize,
@@ -498,14 +517,172 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
 
                 // CALLDATALOAD (0x35)
+                // 0x35 => {
+                //     let fid = get_runtime_func(module, funcs, "jit_calldataload", 3);
+                //     let func_ref = module.declare_func_in_func(fid, builder.func);
+                //     let ptr_top = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
+                //     builder
+                //         .ins()
+                //         .call(func_ref, &[ptr_top, input_ptr, input_len]);
+                // }
+
+                // CALLDATALOAD (0x35) [Stability Fix: Revert to I64 to prevent Alignment Crash]
                 0x35 => {
-                    let fid = get_runtime_func(module, funcs, "jit_calldataload", 3);
-                    let func_ref = module.declare_func_in_func(fid, builder.func);
                     let ptr_top = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
+                    // [중요] unaligned 접근을 명시하지만, I128은 CPU 레벨에서 터질 수 있어 I64가 안전함
+                    let mem = MemFlags::new();
+
+                    // --- [1] 조건 검사 (Checks) ---
+                    let evm_offset = builder.ins().load(types::I64, mem, ptr_top, 0);
+
+                    // High Bits Check
+                    let w1 = builder.ins().load(types::I64, mem, ptr_top, 8);
+                    let w2 = builder.ins().load(types::I64, mem, ptr_top, 16);
+                    let w3 = builder.ins().load(types::I64, mem, ptr_top, 24);
+
+                    let high_tmp = builder.ins().bor(w1, w2);
+                    let high_bits = builder.ins().bor(high_tmp, w3);
+
+                    // Blocks
+                    let block_check_range = builder.create_block();
+                    let block_check_end = builder.create_block();
+                    let block_fast = builder.create_block();
+                    let block_zero = builder.create_block();
+                    let block_partial = builder.create_block();
+                    let block_done = builder.create_block();
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+
+                    // (1) Huge Offset -> Zero
+                    let has_high_bits = builder.ins().icmp_imm(IntCC::NotEqual, high_bits, 0);
                     builder
                         .ins()
-                        .call(func_ref, &[ptr_top, input_ptr, input_len]);
+                        .brif(has_high_bits, block_zero, &[], block_check_range, &[]);
+
+                    // (2) Total OOB -> Zero
+                    builder.switch_to_block(block_check_range);
+                    let is_total_oob = builder.ins().icmp(
+                        IntCC::UnsignedGreaterThanOrEqual,
+                        evm_offset,
+                        input_len,
+                    );
+
+                    builder
+                        .ins()
+                        .brif(is_total_oob, block_zero, &[], block_check_end, &[]);
+
+                    // (3) Partial Check
+                    builder.switch_to_block(block_check_end);
+                    let end_idx = builder.ins().iadd_imm(evm_offset, 32);
+                    let is_partial =
+                        builder
+                            .ins()
+                            .icmp(IntCC::UnsignedGreaterThan, end_idx, input_len);
+                    builder
+                        .ins()
+                        .brif(is_partial, block_partial, &[], block_fast, &[]);
+
+                    // --- [2] Block Zero: 0 채우기 (I64 x 4) ---
+                    // I128 Store는 스택 정렬이 안 맞으면 터질 수 있으므로 I64로 안전하게 처리
+                    builder.switch_to_block(block_zero);
+                    // let zero = builder.ins().iconst(types::I64, 0);
+
+                    builder.ins().store(mem, zero, ptr_top, 0);
+                    builder.ins().store(mem, zero, ptr_top, 8);
+                    builder.ins().store(mem, zero, ptr_top, 16);
+                    builder.ins().store(mem, zero, ptr_top, 24);
+
+                    builder.ins().jump(block_done, &[]);
+
+                    // --- [3] Fast Path: 32바이트 복사 (I64 x 4) ---
+                    // Input Pointer는 16바이트 정렬이 보장되지 않으므로 I128 Load는 위험함
+                    builder.switch_to_block(block_fast);
+                    let src_ptr = builder.ins().iadd(input_ptr, evm_offset);
+
+                    // High (Offset 24)
+                    let val_hi_be = builder.ins().load(types::I64, mem, src_ptr, 0);
+                    let val_hi_le = builder.ins().bswap(val_hi_be);
+                    builder.ins().store(mem, val_hi_le, ptr_top, 24);
+
+                    // Mid1 (Offset 16)
+                    let val_mid1_be = builder.ins().load(types::I64, mem, src_ptr, 8);
+                    let val_mid1_le = builder.ins().bswap(val_mid1_be);
+                    builder.ins().store(mem, val_mid1_le, ptr_top, 16);
+
+                    // Mid2 (Offset 8)
+                    let val_mid2_be = builder.ins().load(types::I64, mem, src_ptr, 16);
+                    let val_mid2_le = builder.ins().bswap(val_mid2_be);
+                    builder.ins().store(mem, val_mid2_le, ptr_top, 8);
+
+                    // Low (Offset 0)
+                    let val_lo_be = builder.ins().load(types::I64, mem, src_ptr, 24);
+                    let val_lo_le = builder.ins().bswap(val_lo_be);
+                    builder.ins().store(mem, val_lo_le, ptr_top, 0);
+
+                    builder.ins().jump(block_done, &[]);
+
+                    // --- [4] Partial Path: 바이트 루프 (Inline) ---
+                    builder.switch_to_block(block_partial);
+                    // 1. 선제적 0 초기화 (I64 x 4)
+                    builder.ins().store(mem, zero, ptr_top, 0);
+                    builder.ins().store(mem, zero, ptr_top, 8);
+                    builder.ins().store(mem, zero, ptr_top, 16);
+                    builder.ins().store(mem, zero, ptr_top, 24);
+
+                    // 2. 루프 로직 (기존과 동일)
+                    let remaining = builder.ins().isub(input_len, evm_offset);
+                    let loop_header = builder.create_block();
+                    let loop_body = builder.create_block();
+                    let loop_exit = builder.create_block();
+
+                    let idx_init = builder.ins().iconst(types::I64, 0);
+                    builder.ins().jump(loop_header, &[idx_init]);
+
+                    // Loop Header
+                    builder.switch_to_block(loop_header);
+                    builder.append_block_param(loop_header, types::I64); // 이 줄 추가 필요
+                    let idx = builder.block_params(loop_header)[0];
+                    let loop_cond =
+                        builder
+                            .ins()
+                            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, remaining);
+                    builder
+                        .ins()
+                        .brif(loop_cond, loop_exit, &[], loop_body, &[]);
+
+                    // Loop Body
+                    builder.switch_to_block(loop_body);
+                    let src_offset = builder.ins().iadd(evm_offset, idx);
+                    let byte_ptr = builder.ins().iadd(input_ptr, src_offset);
+                    let byte_val = builder.ins().load(types::I8, mem, byte_ptr, 0);
+
+                    let const_31 = builder.ins().iconst(types::I64, 31);
+                    let dst_idx = builder.ins().isub(const_31, idx);
+                    let dst_ptr = builder.ins().iadd(ptr_top, dst_idx);
+
+                    builder.ins().store(mem, byte_val, dst_ptr, 0);
+
+                    let idx_next = builder.ins().iadd_imm(idx, 1);
+                    builder.ins().jump(loop_header, &[idx_next]);
+
+                    // Loop Exit
+                    builder.switch_to_block(loop_exit);
+                    builder.ins().jump(block_done, &[]);
+
+                    // --- Finish ---
+                    builder.switch_to_block(block_done);
+
+                    builder.seal_block(block_check_range);
+                    builder.seal_block(block_check_end);
+                    builder.seal_block(block_zero);
+                    builder.seal_block(block_fast);
+                    builder.seal_block(block_partial);
+                    builder.seal_block(loop_header);
+                    builder.seal_block(loop_body);
+                    builder.seal_block(loop_exit);
+                    builder.seal_block(block_done);
                 }
+
                 // CALLDATASIZE (0x36)
                 0x36 => {
                     // Stack: Push 1 (input_len)
@@ -962,6 +1139,21 @@ pub extern "C" fn compile_trace(
         builder.ins().return_(&[]);
         builder.finalize();
         // println!("AAA {}", cnt);
+
+        let res = verify_function(&ctx.func, &*engine.isa);
+        if let Err(errors) = res {
+            if !err_out.is_null() {
+                let error_msg = format!("IR Verifier Error: {}", errors);
+                let c_str = CString::new(error_msg).unwrap();
+
+                unsafe {
+                    // err_out이 가리키는 곳에 문자열 주소를 씀
+                    *err_out = c_str.into_raw();
+                }
+            }
+            // 실패했으므로 함수 포인터는 null 리턴
+            return ptr::null_mut();
+        }
     }
 
     engine.counter += 1;

@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"unsafe"
@@ -21,7 +22,8 @@ import (
 //   - len:    Length of code (and pc_map)
 // Output:
 //   - Pointer to the generated machine code
-void* compile_trace(void* engine, const uint8_t* code, const uint64_t* pc_map, size_t len);
+void* compile_trace(void* engine, char** err_out, const uint8_t* code, const uint64_t* pc_map, size_t len);
+void free_error_msg(char* s);
 */
 import "C"
 
@@ -55,7 +57,7 @@ var (
 
 // [Phase 1] 실행 전 준비 (Run 함수 도입부에서 호출)
 // 컨트랙트 코드 전체를 분석하여 JIT 가능한 모든 블록을 미리 컴파일하고 캐싱합니다.
-func (in *EVMInterpreter) PrepareJit(contract *Contract) {
+func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 	codeHash := contract.CodeHash
 
 	// 1. [Fast Check] 이미 분석된 컨트랙트인지 확인
@@ -64,7 +66,7 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) {
 	cacheLock.RUnlock()
 
 	if analyzed {
-		return // 이미 분석 끝난 놈이다. (JIT 블록이 있든 없든)
+		return nil // 이미 분석 끝난 놈이다. (JIT 블록이 있든 없든)
 	}
 
 	// 2. 전체 코드 분석 (Batch Analysis)
@@ -73,13 +75,13 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) {
 	analyzedContracts[codeHash] = true
 
 	if len(batchResults) == 0 {
-		return // JIT 가능한 구간 없음
+		return nil // JIT 가능한 구간 없음
 	}
 
 	// 3. 엔진 초기화
 	in.initJitEngine()
 	if in.jitEngine == nil {
-		return
+		return errors.New("JIT engine is not initialized")
 	}
 
 	// 4. 컴파일 및 등록 (Batch Compile)
@@ -122,15 +124,21 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) {
 			continue
 		}
 
+		var cErrMsg *C.char = nil // 초기값 nil
 		rawPtr := C.compile_trace(
 			in.jitEngine,
+			(**C.char)(unsafe.Pointer(&cErrMsg)),
 			(*C.uint8_t)(unsafe.Pointer(&linearCode[0])),
 			(*C.uint64_t)(unsafe.Pointer(&linearPC[0])),
 			C.size_t(len(linearCode)),
 		)
-
+		if cErrMsg != nil {
+			goMsg := C.GoString(cErrMsg)
+			C.free_error_msg(cErrMsg)
+			return errors.New(fmt.Sprintf("JIT compilation error: %s", goMsg))
+		}
 		if rawPtr == nil {
-			continue
+			return errors.New("JIT compilation failed with unknown error")
 		}
 
 		// --- Save ---
@@ -152,6 +160,8 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) {
 		jitCompiledContracts[*contract.CodeAddr] = compiledCode
 		fmt.Println("###", startPC, trace.NextPC)
 	}
+
+	return nil
 }
 
 // [Phase 2] 실행 중 조회 (Run 루프 안에서 호출)

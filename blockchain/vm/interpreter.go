@@ -281,7 +281,15 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err
 	// the execution of one of the operations or until the done flag is set by the
 	// parent context.
 	// t := time.Now()
+
+	// var t time.Time
 	for atomic.LoadInt32(&in.evm.abort) == 0 {
+		// if pc == 165 {
+		// 	t = time.Now()
+		// }
+		// if pc == 178 {
+		// 	fmt.Println("AAA", time.Since(t))
+		// }
 		if in.evm.Config.EnableOpDebug {
 			opExecStart = time.Now()
 		}
@@ -494,10 +502,17 @@ func (in *EVMInterpreter) JITRun(contract *Contract, input []byte) (ret []byte, 
 	// 	dojit = true
 	// }
 
+	// t := time.Now()
 	for atomic.LoadInt32(&in.evm.abort) == 0 {
-		if printPC {
-			fmt.Println("@@", pc)
-		}
+		// if pc == 165 {
+		// 	t = time.Now()
+		// }
+		// if pc == 178 {
+		// 	fmt.Println("AAA", time.Since(t))
+		// }
+		// if printPC {
+		// 	fmt.Println("@@", pc)
+		// }
 
 		// 		nextPC, jitExecuted := in.tryExecuteJitSimple(contract, stack, pc)
 		// 		if jitExecuted {
@@ -591,8 +606,8 @@ func (in *EVMInterpreter) JITRun(contract *Contract, input []byte) (ret []byte, 
 			break
 		}
 		pc++
-
 	}
+	// fmt.Println("JIT ELAPSED", time.Since(t))
 	// if *contract.CodeAddr == common.HexToAddress("0x5dDeE20Ddf85CDc5837951653395B6015B926666") {
 	// 	// if *contract.CodeAddr == common.HexToAddress("0x2b807970885dE1cb66b5BD013F8E546aa2A4e7D5") {
 	// fmt.Println("ELAPSED", time.Since(t))

@@ -272,10 +272,12 @@ func enableJitFlag(jt *JumpTable) {
 }
 
 func opJit(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+	// t := time.Now()
 	nextPC, jitExecuted := interpreter.tryExecuteJitSimple(scope.Contract, scope.Stack, scope.Contract.Input, *pc)
+	// fmt.Println("LLL", *pc, nextPC, time.Since(t))
 	if jitExecuted {
 		*pc = nextPC - 1
-		fmt.Println("JITEXECUTED", *pc)
+		// fmt.Println("JITEXECUTED", *pc)
 	}
 	return nil, nil
 }
