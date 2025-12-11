@@ -66,12 +66,13 @@ type traceAnalyzer struct {
 
 func newTraceAnalyzer(code []byte, pc uint64) *traceAnalyzer {
 	return &traceAnalyzer{
-		code:      code,
-		pc:        pc,
-		startPC:   pc,
-		segOffset: pc,
-		visited:   make(map[uint64]bool),
-		results:   make(BatchAnalysisResult),
+		code: code,
+		// pc:        pc,
+		// startPC:   pc,
+		// segOffset: pc,
+		visited:  make(map[uint64]bool),
+		results:  make(BatchAnalysisResult),
+		worklist: []uint64{pc},
 	}
 }
 
@@ -82,75 +83,76 @@ func AnalyzeTrace(code []byte, pc uint64) BatchAnalysisResult {
 	return analyzer.run()
 }
 
-// tryStaticJump: PUSH + JUMP 패턴을 감지하고 Trace를 잇습니다.
-func (az *traceAnalyzer) tryStaticJump() bool {
-	// 조건 1: 직전이 PUSH 계열인가?
-	if !az.isLastOpPush() {
-		return false
-	}
+// // tryStaticJump: PUSH + JUMP 패턴을 감지하고 Trace를 잇습니다.
+// func (az *traceAnalyzer) tryStaticJump() bool {
+// 	// 조건 1: 직전이 PUSH 계열인가?
+// 	if !az.isLastOpPush() {
+// 		return false
+// 	}
 
-	// 1. [Check 1] 값이 코드 길이보다 큰가? (거대수 포함)
-	dest, ok := az.getDestIfValid(az.lastPushData)
-	if !ok {
-		return false // 범위 초과
-	}
+// 	// 1. [Check 1] 값이 코드 길이보다 큰가? (거대수 포함)
+// 	dest, ok := az.getDestIfValid(az.lastPushData)
+// 	if !ok {
+// 		return false // 범위 초과
+// 	}
 
-	// 2. [Check 2] JUMPDEST 확인
-	// (위에서 범위 체크 끝났으니 인덱싱 안전함)
-	if az.code[dest] != 0x5b {
-		return false
-	}
+// 	// 2. [Check 2] JUMPDEST 확인
+// 	// (위에서 범위 체크 끝났으니 인덱싱 안전함)
+// 	if az.code[dest] != 0x5b {
+// 		return false
+// 	}
 
-	// 3-1. 이미 분석 완료된 블록인가? -> 연결 불가
-	if _, exists := az.results[dest]; exists {
-		return false // Fusion 실패 -> Main loop에서 discard 됨
-	}
+// 	// 3-1. 이미 분석 완료된 블록인가? -> 연결 불가
+// 	if _, exists := az.results[dest]; exists {
+// 		return false // Fusion 실패 -> Main loop에서 discard 됨
+// 	}
 
-	// 3-2. 루프 감지 (현재 경로상에 있는가?) -> 연결 불가
-	if az.visited[dest] {
-		return false // Fusion 실패 -> Main loop에서 discard 됨
-	}
+// 	// 3-2. 루프 감지 (현재 경로상에 있는가?) -> 연결 불가
+// 	if az.visited[dest] {
+// 		return false // Fusion 실패 -> Main loop에서 discard 됨
+// 	}
 
-	// =========================================================
-	// [Missing Check] 가스비 누락 방지!
-	// =========================================================
-	// JUMP 명령어를 JIT 목록에서 삭제(Fusion)하더라도,
-	// EVM 스펙상 JUMP 가스비(8)는 소모되어야 합니다.
-	// 이 함수가 true를 리턴하면 메인 루프의 가스 계산을 건너뛰므로, 여기서 더해줘야 합니다.
+// 	// =========================================================
+// 	// [Missing Check] 가스비 누락 방지!
+// 	// =========================================================
+// 	// JUMP 명령어를 JIT 목록에서 삭제(Fusion)하더라도,
+// 	// EVM 스펙상 JUMP 가스비(8)는 소모되어야 합니다.
+// 	// 이 함수가 true를 리턴하면 메인 루프의 가스 계산을 건너뛰므로, 여기서 더해줘야 합니다.
 
-	az.totalGas += jitGasTable[0x56] // JUMP Gas (8)
+// 	az.totalGas += jitGasTable[0x56] // JUMP Gas (8)
 
-	// Subtract one becuaase we removed `push` instruction
-	az.currentRelDepth -= 1
+// 	// Subtract one becuaase we removed `push` instruction
+// 	az.currentRelDepth -= 1
 
-	// >>> Optimization: Instruction Fusion <<<
-	// 직전 PUSH와 현재 JUMP 명령어를 JIT 실행 목록에서 제거함.
-	// 현재 세그먼트 길이에서 직전 명령어(PUSH) 길이만큼 뺌.
-	az.segLen -= az.lastInstSize
+// 	// >>> Optimization: Instruction Fusion <<<
+// 	// 직전 PUSH와 현재 JUMP 명령어를 JIT 실행 목록에서 제거함.
+// 	// 현재 세그먼트 길이에서 직전 명령어(PUSH) 길이만큼 뺌.
+// 	az.segLen -= az.lastInstSize
 
-	// 현재까지의 세그먼트 저장 (길이가 0보다 클 때만)
-	// fmt.Println("S-3")
-	az.finishSegment()
-	// fmt.Println("S-4")
+// 	// 현재까지의 세그먼트 저장 (길이가 0보다 클 때만)
+// 	// fmt.Println("S-3")
+// 	az.finishSegment()
+// 	// fmt.Println("S-4")
 
-	// State Update: PUSH(+1) -> JUMP(-1) 이므로 스택 델타는 변화 없음 (그대로 유지)
+// 	// State Update: PUSH(+1) -> JUMP(-1) 이므로 스택 델타는 변화 없음 (그대로 유지)
 
-	// PC 점프
-	az.pc = dest
+// 	// PC 점프
+// 	az.pc = dest
 
-	// 새 세그먼트 시작 준비
-	az.segOffset = dest
-	az.segLen = 0
-	az.resetLastOp() // 점프 직후엔 직전 명령어 정보 초기화
+// 	// 새 세그먼트 시작 준비
+// 	az.segOffset = dest
+// 	az.segLen = 0
+// 	az.resetLastOp() // 점프 직후엔 직전 명령어 정보 초기화
 
-	return true
-}
+// 	return true
+// }
 
 // finalizeStep: 스택 계산, PC 이동, 히스토리 기록
 func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	// 1. 가스비 계산 및 누적
 	gas := jitGasTable[op]
-	if gas == 0 && op != 0x00 {
+	// TODO: 0x5f condition is for hardfork-awareness.
+	if gas == 0 && op != 0x00 && op != 0x5f {
 		// 테이블에 0으로 되어있는데 STOP(0x00)이 아니면,
 		// 우리가 가스비를 정의 안 한 미지원 Opcode일 수 있음 -> 안전하게 JIT 포기
 		// (PUSH0 같은 0 cost opcode 제외)
@@ -362,131 +364,176 @@ type BatchAnalysisResult map[uint64]JitTraceResult
 
 const MinJitBlockSize = 8
 
-// Helper: 큐에 추가 (중복 방지는 pop할 때 체크하므로 여기선 그냥 넣음)
-func (az *traceAnalyzer) addToWorklist(pc uint64) {
-	// 유효 범위 체크
-	if pc >= uint64(len(az.code)) {
-		return
-	}
-	az.worklist = append(az.worklist, pc)
-}
-
-// TODO: valid jump dest가 발견안될경우 핸들링이 현재없는상황 (추후에 넣어야함)
 func (az *traceAnalyzer) run() BatchAnalysisResult {
-	az.addToWorklist(0)
+	// Worklist가 빌 때까지 반복 (BFS/DFS)
+	for len(az.worklist) > 0 {
+		// 1. Pop
+		pc := az.worklist[0]
+		az.worklist = az.worklist[1:]
 
-	for az.pc < uint64(len(az.code)) {
-
-		op := az.code[az.pc]
-
-		// ---------------------------------------------------------
-		// [Mode 1] JUMPDEST 탐색 모드 (안전지대 찾기)
-		// ---------------------------------------------------------
-		// JUMP나 JUMPI 이후에는 다음 코드가 데이터인지 코드인지 모르므로
-		// JUMPDEST가 나올 때까지 분석을 중단하고 넘어감.
-		if az.scanningForJumpdest {
-			if op == 0x5b { // JUMPDEST 발견!
-				az.scanningForJumpdest = false
-
-				// 여기서부터 새로운 블록 분석 시작
-				// (JUMPDEST는 제거)
-				// az.prepareNextBlock(az.pc)
-				az.prepareNextBlock(az.pc + 1)
-				az.pc++
-				continue
-			} else {
-				// JUMPDEST가 아니면 그냥 건너뜀
-				az.pc++
-				continue
-			}
+		// 2. 유효성 및 중복 방문 체크
+		if pc >= uint64(len(az.code)) {
+			continue
 		}
-
-		// ---------------------------------------------------------
-		// [Mode 2] 일반 분석 모드
-		// ---------------------------------------------------------
-
-		// [중복 방지] 이미 분석된 블록의 시작점이면 패스
-		if _, exists := az.results[az.pc]; exists {
-			az.discardSegment()
-			az.scanningForJumpdest = true // 이 블록 끝날 때까지 스킵 유도 (단순화)
-			az.pc++
+		if az.visited[pc] {
 			continue
 		}
 
-		az.visited[az.pc] = true
-		info := getOpInfo(op)
-
-		// [Case 1] 미지원 Opcode (Unsupported) -> "여기는 끊고, 바로 다음부터 시작"
-		// (미지원이어도 실행 흐름은 이어지므로 JUMPDEST를 찾을 필요는 없음)
-		if !info.isSupported {
-			az.discardSegment() // 오염됐으니 버림
-			az.pc++
-			az.prepareNextBlock(az.pc) // 바로 재시작
-			continue
-		}
-
-		// [Case 2] JUMP (Unconditional)
-		if op == 0x56 {
-			// Static Jump (Fusion) -> 연결됨 (계속 분석)
-			if az.tryStaticJump() {
-				continue
-			}
-
-			az.saveSegment(az.pc)
-			// [변경] 바로 다음이 아니라, JUMPDEST 찾으러 떠남
-			az.pc++
-			az.scanningForJumpdest = true
-			continue
-		}
-
-		// [Case 3] JUMPI (Conditional) -> "저장하고, JUMPDEST 찾으러 떠남"
-		if op == 0x57 {
-			// NOTE: Do not include `JUMPI` instruction into code segments
-			az.saveSegment(az.pc) // Fall-through를 NextPC로 저장 (런타임엔 갈 수 있으니까)
-
-			// [핵심 변경] JUMPI 뒤는 Dead Code일 수 있음.
-			// 따라서 무작정 분석하지 말고 다음 JUMPDEST까지 건너뜀.
-			az.pc++
-			az.scanningForJumpdest = true
-			continue
-		}
-
-		// optimization: remove JUMPDEST instruction in compiled JIT version
-		if op == 0x5b {
-			// 이전에 모으던 게 있으면 저장
-			az.finishSegment()
-
-			// JUMPDEST 명령어(1바이트) 건너뛰기
-			az.pc++
-
-			// 새 세그먼트 시작 준비
-			az.segOffset = az.pc
-			az.segLen = 0
-
-			az.lastOp = 0x5b
-			az.lastPushData = nil
-			az.lastInstSize = 1
-
-			// 방문 체크 (루프 감지용)
-			az.visited[az.pc-1] = true
-			continue
-		}
-
-		// [Case 4] 일반 명령어
-		if !az.finalizeStep(op, info) {
-			az.discardSegment()
-			az.pc++
-			az.prepareNextBlock(az.pc) // 에러는 그냥 리셋 후 재시작
-			continue
-		}
+		// 3. 새로운 Trace 분석 시작
+		az.analyzeSuperBlock(pc)
 	}
 
-	// 코드 끝
-	az.saveSegment(az.pc)
 	return az.results
 }
 
+// analyzeSuperBlock: JUMPDEST를 무시하고 JUMPI/JUMP까지 길게 분석 (Superblock Strategy)
+func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
+	// 상태 초기화
+	az.resetInternalState(startPC)
+	az.visited[startPC] = true
+
+	localPath := make(map[uint64]bool)
+	localPath[startPC] = true
+
+	// 루프: Control Flow가 바뀔 때까지 무한 직진
+	for az.pc < uint64(len(az.code)) {
+		op := az.code[az.pc]
+
+		// ---------------------------------------------------------
+		// [1] JUMPDEST (0x5b) 처리
+		// ---------------------------------------------------------
+		// Superblock 전략: JUMPDEST에서 블록을 끊지 않고 계속 잇습니다.
+		// 외부에서 들어오는 분기점일 수 있지만, 현재 Trace 관점에서는 단순 통과점입니다.
+		if op == 0x5b {
+			az.finishSegment() // Offset 조정을 위해 끊어줌
+			az.pc++            // JUMPDEST(1byte) 건너뛰기
+			az.segOffset = az.pc
+			az.segLen = 0
+			az.resetLastOp()
+			continue
+		}
+
+		info := getOpInfo(op)
+
+		// ---------------------------------------------------------
+		// [2] 미지원 Opcode (Unsupported)
+		// ---------------------------------------------------------
+		// JIT는 여기서 멈추지만, 인터프리터 실행 후 다음 명령어부터
+		// 다시 JIT가 가능할 수 있으므로 Next PC를 Worklist에 추가합니다.
+		if !info.isSupported {
+			az.saveSegment(az.pc) // NextPC = 현재 위치 (Interpreter 진입점)
+			// az.addToWorklist(az.pc + 1)
+
+			if az.code[az.pc+1] == 0x5b {
+				az.addToWorklist(az.pc + 2)
+			} else {
+				az.addToWorklist(az.pc + 1)
+			}
+			return
+		}
+
+		// ---------------------------------------------------------
+		// [3] JUMP (Unconditional)
+		// ---------------------------------------------------------
+		if op == 0x56 {
+			// Static Jump (Fusion) 확인
+			dest, isStatic := az.checkStaticJump()
+
+			if isStatic {
+				// [Static Jump] -> Inlining 시도
+
+				// 1. 내 꼬리를 물었나? (Infinite Loop 방지)
+				if localPath[dest] {
+					// 루프 발견! 여기서 끊고 Dispatcher에게 넘김
+					az.saveSegment(dest)
+					// (dest는 이미 path에 있으니 startPC로 등록되어 있거나 worklist에 있을 것임)
+					return
+				}
+
+				// 가스비 처리 & 명령어 제거
+				az.totalGas += jitGasTable[0x56]
+				az.currentRelDepth -= 1
+				az.segLen -= az.lastInstSize
+				az.finishSegment()
+
+				// 방문 여부에 따라 Inlining 결정
+				if az.visited[dest] {
+					// 이미 방문함 (Loop Back-edge 등) -> 끊고 Link
+					az.saveSegment(dest)
+				} else {
+					// 처음 방문함 -> Inlining (이어 붙이기)
+					az.pc = dest
+					az.segOffset = dest
+					az.segLen = 0
+					az.resetLastOp()
+					localPath[dest] = true
+					continue // Worklist 추가 없이 직접 이동
+				}
+			} else {
+				// [Dynamic Jump] -> 분석 불가, 여기서 종료
+				az.saveSegment(az.pc)
+
+				// [수정] Dynamic Jump라도 혹시 모를 Fall-through나
+				// 다른 경로에서의 진입을 위해 다음 PC를 Worklist에 추가
+
+				if az.code[az.pc+1] == 0x5b {
+					az.addToWorklist(az.pc + 2)
+				} else {
+					az.addToWorklist(az.pc + 1)
+				}
+			}
+			return
+		}
+
+		// ---------------------------------------------------------
+		// [4] JUMPI (Conditional)
+		// ---------------------------------------------------------
+		if op == 0x57 {
+			// JUMPI는 실행 흐름 분기점이므로 Trace 종료
+			az.saveSegment(az.pc)
+
+			// [수정] Dynamic Target일 수도 있으므로, Fall-through는 무조건 추가
+
+			// 경로 1: Fall-through (조건 거짓)
+			// az.addToWorklist(az.pc + 1)
+
+			if az.code[az.pc+1] == 0x5b {
+				az.addToWorklist(az.pc + 2)
+			} else {
+				az.addToWorklist(az.pc + 1)
+			}
+
+			// 경로 2: Target (조건 참) - Static일 경우만 추가 가능
+			if dest, isStatic := az.checkStaticJump(); isStatic {
+				// az.addToWorklist(dest )
+				az.addToWorklist(dest + 1)
+			}
+
+			return
+		}
+
+		// [5] 일반 명령어 (Normal Execution)
+		if !az.finalizeStep(op, info) {
+			az.discardSegment()
+			return
+		}
+	}
+
+	// 코드 끝(EOF)에 도달
+	az.saveSegment(az.pc)
+}
+
+func (az *traceAnalyzer) addToWorklist(pc uint64) {
+	// 유효 범위 및 방문 여부 체크
+	if pc < uint64(len(az.code)) && !az.visited[pc] {
+		az.worklist = append(az.worklist, pc)
+	}
+}
+
+// // TODO: valid jump dest가 발견안될경우 핸들링이 현재없는상황 (추후에 넣어야함)
 // func (az *traceAnalyzer) run() BatchAnalysisResult {
+// 	az.addToWorklist(0)
+
 // 	for az.pc < uint64(len(az.code)) {
 
 // 		op := az.code[az.pc]
@@ -598,6 +645,24 @@ func (az *traceAnalyzer) run() BatchAnalysisResult {
 // 	return az.results
 // }
 
+func (az *traceAnalyzer) checkStaticJump() (uint64, bool) {
+	if !az.isLastOpPush() {
+		return 0, false
+	}
+
+	dest, ok := az.getDestIfValid(az.lastPushData)
+	if !ok {
+		return 0, false
+	}
+
+	// 목적지가 유효하고 JUMPDEST인지 확인
+	if dest >= uint64(len(az.code)) || az.code[dest] != 0x5b {
+		return 0, false
+	}
+
+	return dest, true
+}
+
 // saveSegment: 현재까지 모은 세그먼트들이 유효하고 길다면 결과 맵에 저장
 func (az *traceAnalyzer) saveSegment(nextPC uint64) {
 	// [핵심 추가] 1. 현재 모으고 있던 조각(Pending)이 있다면 슬라이스에 추가 (Flush)
@@ -645,48 +710,47 @@ func (az *traceAnalyzer) saveSegment(nextPC uint64) {
 	az.results[az.startPC] = res
 
 	// 5. 저장했으므로 내부 버퍼 비우기 (다음 블록 준비)
-	az.resetInternalState()
+	az.segments = az.segments[:0]
 }
 
 // discardSegment: 현재 모으던 블록을 폐기 (오염되었거나, 스티칭 실패 시)
 func (az *traceAnalyzer) discardSegment() {
-	// 저장하지 않고 상태만 초기화
-	az.resetInternalState()
+	az.segments = az.segments[:0]
 }
 
-// prepareNextBlock: 새로운 JIT 블록 탐색을 위한 시작점 설정
-// (미지원 명령어 등을 건너뛴 직후 호출됨)
-func (az *traceAnalyzer) prepareNextBlock(newStartPC uint64) {
-	// 내부 상태(스택 시뮬레이션 등) 리셋
-	az.resetInternalState()
+// // prepareNextBlock: 새로운 JIT 블록 탐색을 위한 시작점 설정
+// // (미지원 명령어 등을 건너뛴 직후 호출됨)
+// func (az *traceAnalyzer) prepareNextBlock(newStartPC uint64) {
+// 	// 내부 상태(스택 시뮬레이션 등) 리셋
+// 	az.resetInternalState()
 
-	// if new start PC is JUMPDEST, then skip it
-	if az.code[newStartPC] == 0x5b {
-		newStartPC++
-	}
+// 	// if new start PC is JUMPDEST, then skip it
+// 	if az.code[newStartPC] == 0x5b {
+// 		newStartPC++
+// 	}
 
-	// 시작점 정보 갱신
-	az.startPC = newStartPC
-	az.segOffset = newStartPC
-}
+// 	// 시작점 정보 갱신
+// 	az.startPC = newStartPC
+// 	az.segOffset = newStartPC
+// }
 
 // resetInternalState: 누적된 시뮬레이션 상태 변수 초기화
-func (az *traceAnalyzer) resetInternalState() {
+func (az *traceAnalyzer) resetInternalState(startPC uint64) {
 	// 세그먼트 리스트 비움
 	az.segments = az.segments[:0] // GC 효율을 위해 capacity는 유지하고 len만 0으로 (az.segments[:0]) 해도 됨
+
+	az.pc = startPC
+	az.startPC = startPC
+	az.segOffset = startPC
 
 	// 스택 시뮬레이터 초기화 (새 블록은 0부터 시작)
 	az.currentRelDepth = 0
 	az.minStackDepth = 0
 	az.maxGrowth = 0
-
-	// 가스비 초기화
+	az.netDelta = 0
 	az.totalGas = 0
 
-	// Static Jump 분석용 임시 변수 초기화
-	az.lastOp = 0
-	az.lastInstSize = 0
-	az.lastPushData = nil
+	az.resetLastOp()
 
 	// 현재 세그먼트 길이 초기화
 	az.segLen = 0
