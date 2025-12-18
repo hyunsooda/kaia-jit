@@ -49,7 +49,6 @@ func codeBitmap(code []byte) BitVec {
 	bits := make(BitVec, len(code)/8+1+4)
 	for pc := uint64(0); pc < uint64(len(code)); {
 		op := OpCode(code[pc])
-
 		if op >= PUSH1 && op <= PUSH32 {
 			numbits := op - PUSH1 + 1
 			pc++

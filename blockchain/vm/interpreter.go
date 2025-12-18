@@ -284,11 +284,18 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err
 
 	// var t time.Time
 	for atomic.LoadInt32(&in.evm.abort) == 0 {
-		// if pc == 165 {
+		// if pc == 24 {
 		// 	t = time.Now()
 		// }
-		// if pc == 178 {
+		// if pc == 39 {
 		// 	fmt.Println("AAA", time.Since(t))
+		// }
+
+		// if pc == 234 {
+		// t = time.Now()
+		// }
+		// if pc == 190 {
+		// fmt.Println("@@@@@@@@@@@@@", time.Since(t), pc)
 		// }
 		if in.evm.Config.EnableOpDebug {
 			opExecStart = time.Now()
@@ -301,6 +308,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err
 		// Get the operation from the jump table and validate the stack to ensure there are
 		// enough stack items available to perform the operation.
 		op = contract.GetOp(pc)
+		// fmt.Println("OP", OpCode(op).String())
 		operation := in.cfg.JumpTable[op]
 		if operation == nil {
 			return nil, fmt.Errorf("invalid opcode 0x%x", int(op)) // TODO-Klaytn-Issue615
@@ -343,6 +351,12 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte) (ret []byte, err
 			if allocatedMemorySize < memorySize {
 				extraSize = memorySize - allocatedMemorySize
 			}
+
+			// if contract.Address() == common.HexToAddress("0x786b81Eb450A26E8c3df0104478BA172f77003D1") {
+			// 	if op == 0x52 || op == 0x53 {
+			// 		fmt.Println("@@@", OpCode(op).String(), memSize, extraSize, stack.Back(0).Uint64(), mem.Len())
+			// 	}
+			// }
 		}
 		// Dynamic portion of gas
 		// consume the gas and return an error if not enough gas is available.
@@ -606,6 +620,7 @@ func (in *EVMInterpreter) JITRun(contract *Contract, input []byte) (ret []byte, 
 			break
 		}
 		pc++
+		// fmt.Println("OP", OpCode(op).String(), time.Since(t))
 	}
 	// fmt.Println("JIT ELAPSED", time.Since(t))
 	// if *contract.CodeAddr == common.HexToAddress("0x5dDeE20Ddf85CDc5837951653395B6015B926666") {
@@ -722,6 +737,10 @@ func (in *EVMInterpreter) GetJitEngine() unsafe.Pointer {
 // }
 
 func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, input []byte, pc uint64) (uint64, bool) {
+	// t := time.Now()
+	// if pc == 224 {
+	// 	t = time.Now()
+	// }
 	key := jitCacheKey{contract.CodeHash, pc}
 	jitData := jitCache[key]
 	// jitData := in.GetCachedJit(contract, pc)
@@ -764,7 +783,7 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 	// 2. JIT 실행 (Execute via CGO)
 	// 분석이나 컴파일 과정 없이, 캐시된 '함수 포인터'를 바로 실행
 	var (
-		stackBase                = unsafe.Pointer(&stack.data[0])
+		stackBase                = unsafe.Pointer(unsafe.SliceData(stack.data))
 		cursorPtr                = unsafe.Pointer(uintptr(stackBase) + uintptr(stack.len())*32)
 		inputPtr  unsafe.Pointer = nil
 		inputLen                 = uint64(len(input))
@@ -772,6 +791,7 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 	if len(input) > 0 {
 		inputPtr = unsafe.Pointer(&input[0])
 	}
+
 	// t := time.Now()
 	jitcall.Execute(jitData.fnPtr, cursorPtr, inputPtr, inputLen)
 	// fmt.Println("TT", time.Since(t), jitData.NextPC)
@@ -783,55 +803,8 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 	// )
 	newLen := currentStackLen + jitData.NetStackDelta
 	stack.data = stack.data[:newLen]
-	return jitData.NextPC, true
-}
-
-func (in *EVMInterpreter) nothing(contract *Contract, stack *Stack, pc uint64) (uint64, bool) {
-	key := jitCacheKey{contract.CodeHash, pc}
-	jitData := jitCache[key]
-	// jitData := in.GetCachedJit(contract, pc)
-	if jitData == nil {
-		return 0, false // JIT 불가능한 코드
-	}
-
-	// 3-2: 스택 Underflow (MinStack)
-	// 예: PUSH 10 -> POP 20 인 경우, MinStack은 10임.
-	// 현재 스택이 10개 미만이면 실행 불가. (10개 이상이면 중간에 PUSH 덕분에 안전)
-	if stack.len() < jitData.MinStack {
-		return 0, false // JIT 거부 -> 인터프리터가 돌다가 에러 냄
-	}
-
-	// 3-3: 스택 Overflow (MaxStackGrowth)
-	if stack.len()+jitData.MaxStackGrowth > int(params.StackLimit) {
-		return 0, false
-	}
-
-	// 4. 가스 차감
-	if !contract.UseGas(jitData.TotalGas) {
-		return 0, false
-	}
-
-	// ---------------------------------------------------------
-	// [실행 단계] - 검증 통과했으므로 안전하게 실행
-	// ---------------------------------------------------------
-
-	// 1. 스택 메모리 안전 확보 (Stack Growth)
-	// JIT이 실행되면서 스택을 늘릴 때, cap이 부족하면 Crash가 나므로 미리 확보
-	currentStackLen := stack.len()
-	neededCap := currentStackLen + jitData.MaxStackGrowth
-	if neededCap > cap(stack.data) {
-		newCap := neededCap + 128 // 여유분 확보
-		newData := make([]uint256.Int, currentStackLen, newCap)
-		copy(newData, stack.data)
-		stack.data = newData
-	}
-
-	// 2. JIT 실행 (Execute via CGO)
-	// 분석이나 컴파일 과정 없이, 캐시된 '함수 포인터'를 바로 실행
-	// stackBase := unsafe.Pointer(&stack.data[0])
-	// cursorPtr := unsafe.Pointer(uintptr(stackBase) + uintptr(stack.len())*32)
-
-	newLen := currentStackLen + jitData.NetStackDelta
-	stack.data = stack.data[:newLen]
+	// if jitData.NextPC == 233 {
+	// 	fmt.Println("@@@@@@@@@@@@@", time.Since(t), pc)
+	// }
 	return jitData.NextPC, true
 }

@@ -2,6 +2,7 @@ package jit
 
 import (
 	"encoding/binary"
+	"fmt"
 	"slices"
 )
 
@@ -362,7 +363,61 @@ type BatchAnalysisResult map[uint64]JitTraceResult
 // 너무 짧은 코드(예: PUSH 1개)는 JIT 오버헤드가 더 크므로 무시
 // const MinJitBlockSize = 10
 
-const MinJitBlockSize = 8
+// const MinJitBlockSize = 8
+const MinJitBlockSize = 5
+
+func (az *traceAnalyzer) prerun() map[uint64]any {
+	var (
+		pc           = uint64(0)
+		allDest      = make(map[uint64]any)
+		destRemovals = make(map[uint64]any)
+		jumpdests    = make(map[uint64]any)
+		pushes       = make(map[uint64]any)
+	)
+	for pc < uint64(len(az.code)) {
+		op := az.code[pc]
+		if op >= 0x60 && op <= 0x7f { // PUSH1..32
+			dataLen := uint64(op - 0x60 + 1)
+			nextPc := pc + dataLen + 1
+			if nextPc > uint64(len(az.code)) {
+				break
+			}
+			pushVal := az.code[pc+1 : pc+dataLen+1]
+			nextPcOp := az.code[nextPc]
+			if nextPcOp == 0x56 || nextPcOp == 0x57 {
+				buf := make([]byte, 8)
+				copy(buf, pushVal)
+				dest := binary.LittleEndian.Uint64(buf)
+				destRemovals[dest] = struct{}{}
+			} else {
+				if dest, ok := az.getDestIfValid(pushVal); ok {
+					if az.code[dest] == 0x5b {
+						allDest[dest] = struct{}{}
+					}
+				}
+			}
+
+			buf := make([]byte, 8)
+			copy(buf, pushVal)
+			pushV := binary.LittleEndian.Uint64(buf)
+			pushes[pushV] = struct{}{}
+		}
+		if op == 0x5b {
+			jumpdests[pc] = struct{}{}
+		}
+		pc++
+	}
+	for dest := range destRemovals {
+		delete(allDest, dest)
+	}
+	// for dest := range pushes {
+	// 	if _, exist := jumpdests[dest]; exist {
+	// 		fmt.Println("WHAT", dest)
+	// 		delete(allDest, dest)
+	// 	}
+	// }
+	return allDest
+}
 
 func (az *traceAnalyzer) run() BatchAnalysisResult {
 	// Worklist가 빌 때까지 반복 (BFS/DFS)
@@ -383,6 +438,34 @@ func (az *traceAnalyzer) run() BatchAnalysisResult {
 		az.analyzeSuperBlock(pc)
 	}
 
+	// for visit := range az.visited {
+	// 	fmt.Println("VISIT", visit)
+	// }
+
+	// for dest := range az.prerun() {
+	// 	if dest == 0x4c {
+	// 		dest -= 1
+	// 	}
+	// 	az.worklist = append(az.worklist, dest+1)
+	// 	fmt.Printf("DEST: %x\n", dest+1)
+	// }
+	// for len(az.worklist) > 0 {
+	// 	// 1. Pop
+	// 	pc := az.worklist[0]
+	// 	az.worklist = az.worklist[1:]
+
+	// 	// 2. 유효성 및 중복 방문 체크
+	// 	if pc >= uint64(len(az.code)) {
+	// 		continue
+	// 	}
+	// 	if az.visited[pc] {
+	// 		continue
+	// 	}
+
+	// 	// 3. 새로운 Trace 분석 시작
+	// 	az.analyzeSuperBlock(pc)
+	// }
+
 	return az.results
 }
 
@@ -395,8 +478,18 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 	localPath := make(map[uint64]bool)
 	localPath[startPC] = true
 
+	enable := false
+	if startPC == 0x4d {
+		// az.startPC = 0x4c
+		fmt.Println("WWW", az.pc, az.segOffset, az.segLen)
+		// enable = true
+	}
+
 	// 루프: Control Flow가 바뀔 때까지 무한 직진
 	for az.pc < uint64(len(az.code)) {
+		if enable {
+			fmt.Printf("@@@: %x\n", az.pc)
+		}
 		op := az.code[az.pc]
 
 		// ---------------------------------------------------------
@@ -424,7 +517,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 			az.saveSegment(az.pc) // NextPC = 현재 위치 (Interpreter 진입점)
 			// az.addToWorklist(az.pc + 1)
 
-			if az.code[az.pc+1] == 0x5b {
+			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 				az.addToWorklist(az.pc + 2)
 			} else {
 				az.addToWorklist(az.pc + 1)
@@ -461,12 +554,27 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 					// 이미 방문함 (Loop Back-edge 등) -> 끊고 Link
 					az.saveSegment(dest)
 				} else {
+					if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
+						// if az.pc == 0x4b {
+						// 	az.addToWorklist(az.pc + 1)
+						// 	fmt.Printf("@@@: %x\n", az.pc+1)
+						// } else {
+						// 	az.addToWorklist(az.pc + 2)
+						// 	fmt.Printf("@@@: %x\n", az.pc+2)
+						// }
+						az.addToWorklist(az.pc + 2)
+						fmt.Printf("@@@: %x\n", az.pc+2)
+					} else {
+						az.addToWorklist(az.pc + 1)
+					}
+
 					// 처음 방문함 -> Inlining (이어 붙이기)
 					az.pc = dest
 					az.segOffset = dest
 					az.segLen = 0
 					az.resetLastOp()
 					localPath[dest] = true
+
 					continue // Worklist 추가 없이 직접 이동
 				}
 			} else {
@@ -476,7 +584,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				// [수정] Dynamic Jump라도 혹시 모를 Fall-through나
 				// 다른 경로에서의 진입을 위해 다음 PC를 Worklist에 추가
 
-				if az.code[az.pc+1] == 0x5b {
+				if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 					az.addToWorklist(az.pc + 2)
 				} else {
 					az.addToWorklist(az.pc + 1)
@@ -497,16 +605,19 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 			// 경로 1: Fall-through (조건 거짓)
 			// az.addToWorklist(az.pc + 1)
 
-			if az.code[az.pc+1] == 0x5b {
+			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 				az.addToWorklist(az.pc + 2)
+				// fmt.Printf("F: %x\n", az.pc+2)
 			} else {
 				az.addToWorklist(az.pc + 1)
+				// fmt.Printf("F: %x\n", az.pc+1)
 			}
 
 			// 경로 2: Target (조건 참) - Static일 경우만 추가 가능
 			if dest, isStatic := az.checkStaticJump(); isStatic {
-				// az.addToWorklist(dest )
+				// az.addToWorklist(dest)
 				az.addToWorklist(dest + 1)
+				// fmt.Printf("T: %x\n", dest+1)
 			}
 
 			return
@@ -525,6 +636,26 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 func (az *traceAnalyzer) addToWorklist(pc uint64) {
 	// 유효 범위 및 방문 여부 체크
+	for pc < uint64(len(az.code)) {
+		op := az.code[pc]
+
+		// PUSH1(0x60) ~ PUSH32(0x7f) 인지 확인
+		if op >= 0x60 && op <= 0x7f {
+			dataLen := uint64(op - 0x60 + 1)
+			// 다음 명령어 위치 = 현재위치 + 1(Opcode) + 데이터길이
+			nextPC := pc + 1 + dataLen
+
+			// 만약 건너뛴 위치가 코드 끝을 넘어가면 중단
+			if nextPC >= uint64(len(az.code)) {
+				pc = nextPC
+				break
+			}
+			pc = nextPC
+		} else {
+			// PUSH가 아니면 루프 종료 (스킵 완료)
+			break
+		}
+	}
 	if pc < uint64(len(az.code)) && !az.visited[pc] {
 		az.worklist = append(az.worklist, pc)
 	}

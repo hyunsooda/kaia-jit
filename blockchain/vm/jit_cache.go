@@ -158,7 +158,25 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 		}
 		compiledCode[startPC] = JIT_FLAG
 		jitCompiledContracts[*contract.CodeAddr] = compiledCode
-		fmt.Println("###", startPC, trace.NextPC)
+		fmt.Printf("### %x %x\n", startPC, trace.NextPC)
+
+		// compiledCode := make([]byte, len(contract.Code)+1)
+
+		// var srcCode []byte
+		// if len(jitCompiledContracts[*contract.CodeAddr]) > 0 {
+		// 	srcCode = jitCompiledContracts[*contract.CodeAddr]
+		// } else {
+		// 	srcCode = contract.Code
+		// }
+		// copy(compiledCode[:startPC], srcCode[:startPC])
+		// compiledCode[startPC] = JIT_FLAG
+		// copy(compiledCode[startPC+1:], srcCode[startPC:])
+		// fmt.Printf("### %x %x\n", startPC, trace.NextPC)
+		// jitCompiledContracts[*contract.CodeAddr] = compiledCode
+
+		// if jitCache[key].NextPC > startPC {
+		// 	jitCache[key].NextPC += 1
+		// }
 	}
 
 	return nil
