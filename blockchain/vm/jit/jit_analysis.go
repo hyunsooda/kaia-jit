@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // --- [1] 데이터 구조 정의 ---
@@ -30,6 +31,12 @@ type opInfo struct {
 	isStaticPush bool // PUSH0 ~ PUSH32 여부
 }
 
+type analysisSlot struct {
+	src      uint64
+	isStatic bool   // PUSH로 만든 상수인가?
+	val      uint64 // 상수값
+}
+
 // --- [2] 분석기 상태 관리 (State Machine) ---
 
 type traceAnalyzer struct {
@@ -41,13 +48,14 @@ type traceAnalyzer struct {
 	// [추가] 분석 결과 저장소 (여기에 모아서 반환함)
 	results BatchAnalysisResult
 
+	jumpTargets map[uint64]uint64
+	blockStacks map[string][]analysisSlot
+
 	visited map[uint64]bool
 
-	// [추가] 흐름이 끊겨서 다음 JUMPDEST를 찾고 있는 중인가?
-	scanningForJumpdest bool
+	jumpDests BitVec
 
 	// 스택 상태 추적
-	netDelta        int
 	currentRelDepth int
 	minStackDepth   int
 	maxGrowth       int
@@ -71,9 +79,12 @@ func newTraceAnalyzer(code []byte, pc uint64) *traceAnalyzer {
 		// pc:        pc,
 		// startPC:   pc,
 		// segOffset: pc,
-		visited:  make(map[uint64]bool),
-		results:  make(BatchAnalysisResult),
-		worklist: []uint64{pc},
+		jumpDests:   codeBitmap(code),
+		jumpTargets: make(map[uint64]uint64),
+		blockStacks: make(map[string][]analysisSlot),
+		visited:     make(map[uint64]bool),
+		results:     make(BatchAnalysisResult),
+		worklist:    []uint64{pc},
 	}
 }
 
@@ -84,69 +95,15 @@ func AnalyzeTrace(code []byte, pc uint64) BatchAnalysisResult {
 	return analyzer.run()
 }
 
-// // tryStaticJump: PUSH + JUMP 패턴을 감지하고 Trace를 잇습니다.
-// func (az *traceAnalyzer) tryStaticJump() bool {
-// 	// 조건 1: 직전이 PUSH 계열인가?
-// 	if !az.isLastOpPush() {
-// 		return false
-// 	}
-
-// 	// 1. [Check 1] 값이 코드 길이보다 큰가? (거대수 포함)
-// 	dest, ok := az.getDestIfValid(az.lastPushData)
-// 	if !ok {
-// 		return false // 범위 초과
-// 	}
-
-// 	// 2. [Check 2] JUMPDEST 확인
-// 	// (위에서 범위 체크 끝났으니 인덱싱 안전함)
-// 	if az.code[dest] != 0x5b {
-// 		return false
-// 	}
-
-// 	// 3-1. 이미 분석 완료된 블록인가? -> 연결 불가
-// 	if _, exists := az.results[dest]; exists {
-// 		return false // Fusion 실패 -> Main loop에서 discard 됨
-// 	}
-
-// 	// 3-2. 루프 감지 (현재 경로상에 있는가?) -> 연결 불가
-// 	if az.visited[dest] {
-// 		return false // Fusion 실패 -> Main loop에서 discard 됨
-// 	}
-
-// 	// =========================================================
-// 	// [Missing Check] 가스비 누락 방지!
-// 	// =========================================================
-// 	// JUMP 명령어를 JIT 목록에서 삭제(Fusion)하더라도,
-// 	// EVM 스펙상 JUMP 가스비(8)는 소모되어야 합니다.
-// 	// 이 함수가 true를 리턴하면 메인 루프의 가스 계산을 건너뛰므로, 여기서 더해줘야 합니다.
-
-// 	az.totalGas += jitGasTable[0x56] // JUMP Gas (8)
-
-// 	// Subtract one becuaase we removed `push` instruction
-// 	az.currentRelDepth -= 1
-
-// 	// >>> Optimization: Instruction Fusion <<<
-// 	// 직전 PUSH와 현재 JUMP 명령어를 JIT 실행 목록에서 제거함.
-// 	// 현재 세그먼트 길이에서 직전 명령어(PUSH) 길이만큼 뺌.
-// 	az.segLen -= az.lastInstSize
-
-// 	// 현재까지의 세그먼트 저장 (길이가 0보다 클 때만)
-// 	// fmt.Println("S-3")
-// 	az.finishSegment()
-// 	// fmt.Println("S-4")
-
-// 	// State Update: PUSH(+1) -> JUMP(-1) 이므로 스택 델타는 변화 없음 (그대로 유지)
-
-// 	// PC 점프
-// 	az.pc = dest
-
-// 	// 새 세그먼트 시작 준비
-// 	az.segOffset = dest
-// 	az.segLen = 0
-// 	az.resetLastOp() // 점프 직후엔 직전 명령어 정보 초기화
-
-// 	return true
-// }
+func (az *traceAnalyzer) isValidJumpDest(dest uint64) bool {
+	if dest >= uint64(len(az.code)) {
+		return false
+	}
+	if az.code[dest] != 0x5b {
+		return false
+	}
+	return az.jumpDests.codeSegment(dest)
+}
 
 // finalizeStep: 스택 계산, PC 이동, 히스토리 기록
 func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
@@ -174,7 +131,6 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	if az.currentRelDepth > az.maxGrowth {
 		az.maxGrowth = az.currentRelDepth
 	}
-	az.netDelta += (info.pushes - info.pops)
 
 	// 3. PC 이동 계산
 	instSize := uint64(1)
@@ -354,6 +310,131 @@ func getOpInfo(op byte) opInfo {
 	}
 }
 
+// Phase 1 전용 Opcode 정보 반환 (모든 명령어 지원)
+func getPhase1OpInfo(op byte) opInfo {
+	switch {
+	// --- 0x00: Stop & Arithmetic ---
+	case op == 0x00: // STOP
+		return opInfo{0, 0, true, false}
+	case op >= 0x01 && op <= 0x0b: // ADD, MUL, SUB ...
+		if op == 0x08 || op == 0x09 { // ADDMOD, MULMOD
+			return opInfo{3, 1, true, false}
+		}
+		return opInfo{2, 1, true, false} // ADD~SMOD, EXP, SIGNEXTEND
+
+	// --- 0x10: Comparison & Bitwise ---
+	case op >= 0x10 && op <= 0x1d:
+		if op == 0x15 || op == 0x19 { // ISZERO, NOT
+			return opInfo{1, 1, true, false}
+		}
+		return opInfo{2, 1, true, false} // LT~SAR
+
+	// --- 0x20: SHA3 ---
+	case op == 0x20:
+		return opInfo{2, 1, true, false}
+
+	// --- 0x30: Environmental Info ---
+	case op >= 0x30 && op <= 0x3f:
+		if op == 0x31 || op == 0x3b || op == 0x3f { // BALANCE, EXTCODESIZE, EXTCODEHASH
+			return opInfo{1, 1, true, false}
+		}
+		if op == 0x37 || op == 0x39 || op == 0x3e { // CALLDATACOPY, CODECOPY, RETURNDATACOPY
+			return opInfo{3, 0, true, false}
+		}
+		if op == 0x3c { // EXTCODECOPY
+			return opInfo{4, 0, true, false}
+		}
+		if op == 0x35 { // CALLDATALOAD
+			return opInfo{1, 1, true, false}
+		}
+		// ADDRESS, ORIGIN, CALLER, CALLVALUE, CALLDATASIZE, CODESIZE, GASPRICE, RETURNDATASIZE
+		return opInfo{0, 1, true, false}
+
+	// --- 0x40: Block Info ---
+	case op >= 0x40 && op <= 0x4a:
+		if op == 0x40 || op == 0x49 { // BLOCKHASH, BLOBHASH
+			return opInfo{1, 1, true, false}
+		}
+		// COINBASE, TIMESTAMP, NUMBER, PREVRANDAO, GASLIMIT, CHAINID, SELFBALANCE, BASEFEE, BLOBBASEFEE
+		return opInfo{0, 1, true, false}
+
+	// --- 0x50: Stack & Memory & Flow ---
+	case op == 0x50: // POP
+		return opInfo{1, 0, true, false}
+	case op == 0x51: // MLOAD
+		return opInfo{1, 1, true, false}
+	case op == 0x52 || op == 0x53: // MSTORE, MSTORE8
+		return opInfo{2, 0, true, false}
+	case op == 0x54: // SLOAD
+		return opInfo{1, 1, true, false}
+	case op == 0x55: // SSTORE
+		return opInfo{2, 0, true, false}
+	case op == 0x56: // JUMP
+		return opInfo{1, 0, true, false}
+	case op == 0x57: // JUMPI
+		return opInfo{2, 0, true, false}
+	case op == 0x58: // PC
+		return opInfo{0, 1, true, false}
+	case op == 0x59: // MSIZE
+		return opInfo{0, 1, true, false}
+	case op == 0x5a: // GAS
+		return opInfo{0, 1, true, false}
+	case op == 0x5b: // JUMPDEST
+		return opInfo{0, 0, true, false}
+	case op == 0x5c: // TLOAD (Cancun)
+		return opInfo{1, 1, true, false}
+	case op == 0x5d: // TSTORE (Cancun)
+		return opInfo{2, 0, true, false}
+	case op == 0x5e: // MCOPY (Cancun)
+		return opInfo{3, 0, true, false}
+	case op == 0x5f: // PUSH0 (Shanghai)
+		return opInfo{0, 1, true, true} // Static Push
+
+	// --- 0x60: PUSH ---
+	case op >= 0x60 && op <= 0x7f: // PUSH1 ~ PUSH32
+		return opInfo{0, 1, true, true} // Static Push
+
+	// --- 0x80: DUP ---
+	case op >= 0x80 && op <= 0x8f: // DUP1 ~ DUP16
+		// DUP은 Pop하지 않고(0), 하나 더 얹음(1).
+		// *주의*: Underflow 체크(깊이 n개 확인)는 Loop 안에서 별도로 수행해야 함.
+		return opInfo{0, 1, true, false}
+
+	// --- 0x90: SWAP ---
+	case op >= 0x90 && op <= 0x9f: // SWAP1 ~ SWAP16
+		// SWAP은 교체만 하므로 스택 높이 변화 없음.
+		// *주의*: Underflow 체크(깊이 n+1개 확인)는 Loop 안에서 별도로 수행해야 함.
+		return opInfo{0, 0, true, false}
+
+	// --- 0xA0: LOG ---
+	case op >= 0xa0 && op <= 0xa4: // LOG0 ~ LOG4
+		// LOGn pops 2 + n items
+		return opInfo{2 + int(op-0xa0), 0, true, false}
+
+	// --- 0xF0: System ---
+	case op == 0xf0: // CREATE
+		return opInfo{3, 1, true, false}
+	case op == 0xf1 || op == 0xf2: // CALL, CALLCODE
+		return opInfo{7, 1, true, false}
+	case op == 0xf3: // RETURN
+		return opInfo{2, 0, true, false}
+	case op == 0xf4 || op == 0xfa: // DELEGATECALL, STATICCALL
+		return opInfo{6, 1, true, false}
+	case op == 0xf5: // CREATE2
+		return opInfo{4, 1, true, false}
+	case op == 0xfd: // REVERT
+		return opInfo{2, 0, true, false}
+	case op == 0xfe: // INVALID
+		return opInfo{0, 0, false, false}
+	case op == 0xff: // SELFDESTRUCT
+		return opInfo{1, 0, true, false}
+
+	default:
+		// 정의되지 않은 Opcode
+		return opInfo{0, 0, false, false}
+	}
+}
+
 // BatchAnalysisResult: 분석된 JIT 블록들의 집합
 // Key: 블록의 시작 PC (uint64)
 // Value: JIT 실행에 필요한 메타데이터 (가스, 스택 정보 등)
@@ -366,60 +447,13 @@ type BatchAnalysisResult map[uint64]JitTraceResult
 // const MinJitBlockSize = 8
 const MinJitBlockSize = 5
 
-func (az *traceAnalyzer) prerun() map[uint64]any {
-	var (
-		pc           = uint64(0)
-		allDest      = make(map[uint64]any)
-		destRemovals = make(map[uint64]any)
-		jumpdests    = make(map[uint64]any)
-		pushes       = make(map[uint64]any)
-	)
-	for pc < uint64(len(az.code)) {
-		op := az.code[pc]
-		if op >= 0x60 && op <= 0x7f { // PUSH1..32
-			dataLen := uint64(op - 0x60 + 1)
-			nextPc := pc + dataLen + 1
-			if nextPc > uint64(len(az.code)) {
-				break
-			}
-			pushVal := az.code[pc+1 : pc+dataLen+1]
-			nextPcOp := az.code[nextPc]
-			if nextPcOp == 0x56 || nextPcOp == 0x57 {
-				buf := make([]byte, 8)
-				copy(buf, pushVal)
-				dest := binary.LittleEndian.Uint64(buf)
-				destRemovals[dest] = struct{}{}
-			} else {
-				if dest, ok := az.getDestIfValid(pushVal); ok {
-					if az.code[dest] == 0x5b {
-						allDest[dest] = struct{}{}
-					}
-				}
-			}
-
-			buf := make([]byte, 8)
-			copy(buf, pushVal)
-			pushV := binary.LittleEndian.Uint64(buf)
-			pushes[pushV] = struct{}{}
-		}
-		if op == 0x5b {
-			jumpdests[pc] = struct{}{}
-		}
-		pc++
-	}
-	for dest := range destRemovals {
-		delete(allDest, dest)
-	}
-	// for dest := range pushes {
-	// 	if _, exist := jumpdests[dest]; exist {
-	// 		fmt.Println("WHAT", dest)
-	// 		delete(allDest, dest)
-	// 	}
-	// }
-	return allDest
-}
-
 func (az *traceAnalyzer) run() BatchAnalysisResult {
+	az.runPhase1(az.worklist[0])
+
+	for k, v := range az.jumpTargets {
+		fmt.Printf("%x:%x\n", k, v)
+	}
+
 	// Worklist가 빌 때까지 반복 (BFS/DFS)
 	for len(az.worklist) > 0 {
 		// 1. Pop
@@ -438,34 +472,6 @@ func (az *traceAnalyzer) run() BatchAnalysisResult {
 		az.analyzeSuperBlock(pc)
 	}
 
-	// for visit := range az.visited {
-	// 	fmt.Println("VISIT", visit)
-	// }
-
-	// for dest := range az.prerun() {
-	// 	if dest == 0x4c {
-	// 		dest -= 1
-	// 	}
-	// 	az.worklist = append(az.worklist, dest+1)
-	// 	fmt.Printf("DEST: %x\n", dest+1)
-	// }
-	// for len(az.worklist) > 0 {
-	// 	// 1. Pop
-	// 	pc := az.worklist[0]
-	// 	az.worklist = az.worklist[1:]
-
-	// 	// 2. 유효성 및 중복 방문 체크
-	// 	if pc >= uint64(len(az.code)) {
-	// 		continue
-	// 	}
-	// 	if az.visited[pc] {
-	// 		continue
-	// 	}
-
-	// 	// 3. 새로운 Trace 분석 시작
-	// 	az.analyzeSuperBlock(pc)
-	// }
-
 	return az.results
 }
 
@@ -478,18 +484,8 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 	localPath := make(map[uint64]bool)
 	localPath[startPC] = true
 
-	enable := false
-	if startPC == 0x4d {
-		// az.startPC = 0x4c
-		fmt.Println("WWW", az.pc, az.segOffset, az.segLen)
-		// enable = true
-	}
-
 	// 루프: Control Flow가 바뀔 때까지 무한 직진
 	for az.pc < uint64(len(az.code)) {
-		if enable {
-			fmt.Printf("@@@: %x\n", az.pc)
-		}
 		op := az.code[az.pc]
 
 		// ---------------------------------------------------------
@@ -537,6 +533,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 				// 1. 내 꼬리를 물었나? (Infinite Loop 방지)
 				if localPath[dest] {
+					panic("TODO: Remove me")
 					// 루프 발견! 여기서 끊고 Dispatcher에게 넘김
 					az.saveSegment(dest)
 					// (dest는 이미 path에 있으니 startPC로 등록되어 있거나 worklist에 있을 것임)
@@ -546,7 +543,12 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				// 가스비 처리 & 명령어 제거
 				az.totalGas += jitGasTable[0x56]
 				az.currentRelDepth -= 1
-				az.segLen -= az.lastInstSize
+				// az.segLen -= az.lastInstSize
+				if az.lastOp >= 0x60 && az.lastOp <= 0x7f {
+					az.segLen -= az.lastInstSize
+				} else {
+					az.segLen += 1
+				}
 				az.finishSegment()
 
 				// 방문 여부에 따라 Inlining 결정
@@ -555,19 +557,10 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 					az.saveSegment(dest)
 				} else {
 					if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
-						// if az.pc == 0x4b {
-						// 	az.addToWorklist(az.pc + 1)
-						// 	fmt.Printf("@@@: %x\n", az.pc+1)
-						// } else {
-						// 	az.addToWorklist(az.pc + 2)
-						// 	fmt.Printf("@@@: %x\n", az.pc+2)
-						// }
 						az.addToWorklist(az.pc + 2)
-						fmt.Printf("@@@: %x\n", az.pc+2)
 					} else {
 						az.addToWorklist(az.pc + 1)
 					}
-
 					// 처음 방문함 -> Inlining (이어 붙이기)
 					az.pc = dest
 					az.segOffset = dest
@@ -583,7 +576,6 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 				// [수정] Dynamic Jump라도 혹시 모를 Fall-through나
 				// 다른 경로에서의 진입을 위해 다음 PC를 Worklist에 추가
-
 				if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 					az.addToWorklist(az.pc + 2)
 				} else {
@@ -603,21 +595,15 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 			// [수정] Dynamic Target일 수도 있으므로, Fall-through는 무조건 추가
 
 			// 경로 1: Fall-through (조건 거짓)
-			// az.addToWorklist(az.pc + 1)
-
 			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 				az.addToWorklist(az.pc + 2)
-				// fmt.Printf("F: %x\n", az.pc+2)
 			} else {
 				az.addToWorklist(az.pc + 1)
-				// fmt.Printf("F: %x\n", az.pc+1)
 			}
 
 			// 경로 2: Target (조건 참) - Static일 경우만 추가 가능
-			if dest, isStatic := az.checkStaticJump(); isStatic {
-				// az.addToWorklist(dest)
+			if dest, isStatic := az.checkStaticJump(); isStatic && az.isValidJumpDest(dest) {
 				az.addToWorklist(dest + 1)
-				// fmt.Printf("T: %x\n", dest+1)
 			}
 
 			return
@@ -632,6 +618,174 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 	// 코드 끝(EOF)에 도달
 	az.saveSegment(az.pc)
+}
+
+type Worklist struct {
+	startPC uint64
+	srcs    string
+}
+
+func (az *traceAnalyzer) runPhase1(startPC uint64) {
+	// 초기 상태: 시작점 스택은 비어있음
+	az.blockStacks[fmt.Sprintf("%x", startPC)] = []analysisSlot{}
+	var (
+		worklist = []Worklist{{startPC: startPC, srcs: fmt.Sprintf("%x", startPC)}}
+		jumpSrcs = make(map[uint64]map[uint64]bool)
+		// Helper: 스택 전파 (Deep Copy)
+		propagate = func(srcPC, targetPC uint64, originSrcs string, stack []analysisSlot) {
+			newStack := make([]analysisSlot, len(stack))
+			copy(newStack, stack)
+			if strings.Contains(originSrcs, fmt.Sprintf("%x", targetPC)) {
+				return
+			}
+			srcs := fmt.Sprintf("%s-%x-%x", originSrcs, srcPC, targetPC)
+			az.blockStacks[srcs] = newStack
+			worklist = append(worklist, Worklist{startPC: targetPC, srcs: srcs})
+		}
+	)
+
+	isLastOpPush := false
+	for len(worklist) > 0 {
+		var (
+			pc   = worklist[0].startPC
+			srcs = worklist[0].srcs
+		)
+		worklist = worklist[1:]
+		// 현재 블록의 시작 스택 가져오기
+		stack := make([]analysisSlot, len(az.blockStacks[srcs]))
+		copy(stack, az.blockStacks[srcs])
+
+		// 블록 순회
+		for pc < uint64(len(az.code)) {
+			op := az.code[pc]
+			info := getPhase1OpInfo(op)
+
+			// 미지원 Opcode -> 여기서 끊김
+			if !info.isSupported {
+				panic("TODO: Remove me")
+				break
+			}
+
+			// 명령어 길이
+			instSize := uint64(1)
+			if op >= 0x60 && op <= 0x7f {
+				instSize += uint64(op - 0x60 + 1)
+			}
+
+			// Stack Underflow Check
+			if len(stack) < info.pops {
+				panic("TODO: Remove me 1")
+				break
+			}
+
+			// --- Opcode 처리 ---
+			switch {
+			case op == 0x56: // JUMP
+				target := stack[len(stack)-1]     // Top 확인
+				nextStack := stack[:len(stack)-1] // Pop Address
+				if _, exist := jumpSrcs[pc]; !exist {
+					jumpSrcs[pc] = make(map[uint64]bool)
+				}
+				jumpSrcs[pc][target.val] = true
+
+				if target.isStatic {
+					dest := target.val
+					// 유효성 체크
+					if dest < uint64(len(az.code)) && az.code[dest] == 0x5b {
+						if !isLastOpPush {
+							az.jumpTargets[pc] = dest // [기록] Phase 2에서 사용
+						}
+						propagate(pc, dest, srcs, nextStack)
+					}
+				}
+				// Do not add a `pc+1` to worklist because the stack integrity is not gauratneed for next instruction when `jump` is not effective
+				// propagate(pc, pc+1, srcs, nextStack)
+				isLastOpPush = false
+				goto StopBlock // 블록 종료
+
+			case op == 0x57: // JUMPI
+				target := stack[len(stack)-1]     // 2nd Item
+				nextStack := stack[:len(stack)-2] // Pop 2
+
+				// 1. Jump Path
+				if target.isStatic {
+					dest := target.val
+					if dest < uint64(len(az.code)) && az.code[dest] == 0x5b {
+						propagate(pc, dest, srcs, nextStack)
+					}
+				}
+				// 2. Fall-through Path
+				nextPC := pc + instSize
+				if nextPC < uint64(len(az.code)) {
+					propagate(pc, nextPC, srcs, nextStack)
+				}
+				isLastOpPush = false
+				goto StopBlock
+
+			case op >= 0x80 && op <= 0x8f: // DUP
+				n := int(op - 0x80 + 1)
+				if len(stack) < n {
+					panic("TODO: Remove me 2")
+					goto StopBlock
+				}
+				stack = append(stack, stack[len(stack)-n])
+				isLastOpPush = false
+
+			case op >= 0x90 && op <= 0x9f: // SWAP
+				n := int(op - 0x90 + 1)
+				if len(stack) < n+1 {
+					fmt.Printf("AAA %d\n", pc)
+					panic("TODO: Remove me 3")
+					goto StopBlock
+				}
+				topIdx := len(stack) - 1
+				swapIdx := len(stack) - 1 - n
+				stack[topIdx], stack[swapIdx] = stack[swapIdx], stack[topIdx]
+				isLastOpPush = false
+
+			case op >= 0x60 && op <= 0x7f: // PUSH
+				data := az.code[pc+1 : pc+instSize]
+				slot := analysisSlot{src: pc, isStatic: false}
+				// 8바이트 이하 & 코드 범위 내 -> Static
+				if len(data) <= 8 {
+					var buf [8]byte
+					copy(buf[8-len(data):], data)
+					val := binary.BigEndian.Uint64(buf[:])
+					if val < uint64(len(az.code)) {
+						slot = analysisSlot{src: pc, isStatic: true, val: val}
+					}
+				}
+				stack = append(stack, slot)
+				isLastOpPush = true
+
+			case op == 0x5f: // PUSH0
+				isLastOpPush = false
+				stack = append(stack, analysisSlot{src: pc, isStatic: true, val: 0})
+
+			case op == 0x00 || op == 0xf3 || op == 0xfd: // STOP, RETURN, REVERT
+				isLastOpPush = false
+				goto StopBlock
+
+			default: // Others (ADD, etc.) -> 값은 Unknown
+				stack = stack[:len(stack)-info.pops]
+				for i := 0; i < info.pushes; i++ {
+					stack = append(stack, analysisSlot{src: pc, isStatic: false})
+				}
+				isLastOpPush = false
+			}
+
+			pc += instSize
+		}
+	StopBlock:
+	}
+
+	for pc, destMap := range jumpSrcs {
+		if len(destMap) > 1 {
+			if _, exist := az.jumpTargets[pc]; exist {
+				delete(az.jumpTargets, pc)
+			}
+		}
+	}
 }
 
 func (az *traceAnalyzer) addToWorklist(pc uint64) {
@@ -661,122 +815,11 @@ func (az *traceAnalyzer) addToWorklist(pc uint64) {
 	}
 }
 
-// // TODO: valid jump dest가 발견안될경우 핸들링이 현재없는상황 (추후에 넣어야함)
-// func (az *traceAnalyzer) run() BatchAnalysisResult {
-// 	az.addToWorklist(0)
-
-// 	for az.pc < uint64(len(az.code)) {
-
-// 		op := az.code[az.pc]
-
-// 		// ---------------------------------------------------------
-// 		// [Mode 1] JUMPDEST 탐색 모드 (안전지대 찾기)
-// 		// ---------------------------------------------------------
-// 		// JUMP나 JUMPI 이후에는 다음 코드가 데이터인지 코드인지 모르므로
-// 		// JUMPDEST가 나올 때까지 분석을 중단하고 넘어감.
-// 		if az.scanningForJumpdest {
-// 			if op == 0x5b { // JUMPDEST 발견!
-// 				az.scanningForJumpdest = false
-
-// 				// 여기서부터 새로운 블록 분석 시작
-// 				// (JUMPDEST는 제거)
-// 				// az.prepareNextBlock(az.pc)
-// 				az.prepareNextBlock(az.pc + 1)
-// 				az.pc++
-// 				continue
-// 			} else {
-// 				// JUMPDEST가 아니면 그냥 건너뜀
-// 				az.pc++
-// 				continue
-// 			}
-// 		}
-
-// 		// ---------------------------------------------------------
-// 		// [Mode 2] 일반 분석 모드
-// 		// ---------------------------------------------------------
-
-// 		// [중복 방지] 이미 분석된 블록의 시작점이면 패스
-// 		if _, exists := az.results[az.pc]; exists {
-// 			az.discardSegment()
-// 			az.scanningForJumpdest = true // 이 블록 끝날 때까지 스킵 유도 (단순화)
-// 			az.pc++
-// 			continue
-// 		}
-
-// 		az.visited[az.pc] = true
-// 		info := getOpInfo(op)
-
-// 		// [Case 1] 미지원 Opcode (Unsupported) -> "여기는 끊고, 바로 다음부터 시작"
-// 		// (미지원이어도 실행 흐름은 이어지므로 JUMPDEST를 찾을 필요는 없음)
-// 		if !info.isSupported {
-// 			az.discardSegment() // 오염됐으니 버림
-// 			az.pc++
-// 			az.prepareNextBlock(az.pc) // 바로 재시작
-// 			continue
-// 		}
-
-// 		// [Case 2] JUMP (Unconditional)
-// 		if op == 0x56 {
-// 			// Static Jump (Fusion) -> 연결됨 (계속 분석)
-// 			if az.tryStaticJump() {
-// 				continue
-// 			}
-
-// 			az.saveSegment(az.pc)
-// 			// [변경] 바로 다음이 아니라, JUMPDEST 찾으러 떠남
-// 			az.pc++
-// 			az.scanningForJumpdest = true
-// 			continue
-// 		}
-
-// 		// [Case 3] JUMPI (Conditional) -> "저장하고, JUMPDEST 찾으러 떠남"
-// 		if op == 0x57 {
-// 			// NOTE: Do not include `JUMPI` instruction into code segments
-// 			az.saveSegment(az.pc) // Fall-through를 NextPC로 저장 (런타임엔 갈 수 있으니까)
-
-// 			// [핵심 변경] JUMPI 뒤는 Dead Code일 수 있음.
-// 			// 따라서 무작정 분석하지 말고 다음 JUMPDEST까지 건너뜀.
-// 			az.pc++
-// 			az.scanningForJumpdest = true
-// 			continue
-// 		}
-
-// 		// optimization: remove JUMPDEST instruction in compiled JIT version
-// 		if op == 0x5b {
-// 			// 이전에 모으던 게 있으면 저장
-// 			az.finishSegment()
-
-// 			// JUMPDEST 명령어(1바이트) 건너뛰기
-// 			az.pc++
-
-// 			// 새 세그먼트 시작 준비
-// 			az.segOffset = az.pc
-// 			az.segLen = 0
-
-// 			az.lastOp = 0x5b
-// 			az.lastPushData = nil
-// 			az.lastInstSize = 1
-
-// 			// 방문 체크 (루프 감지용)
-// 			az.visited[az.pc-1] = true
-// 			continue
-// 		}
-
-// 		// [Case 4] 일반 명령어
-// 		if !az.finalizeStep(op, info) {
-// 			az.discardSegment()
-// 			az.pc++
-// 			az.prepareNextBlock(az.pc) // 에러는 그냥 리셋 후 재시작
-// 			continue
-// 		}
-// 	}
-
-// 	// 코드 끝
-// 	az.saveSegment(az.pc)
-// 	return az.results
-// }
-
 func (az *traceAnalyzer) checkStaticJump() (uint64, bool) {
+	if dest, exist := az.jumpTargets[az.pc]; exist {
+		return dest, true
+	}
+
 	if !az.isLastOpPush() {
 		return 0, false
 	}
@@ -878,7 +921,6 @@ func (az *traceAnalyzer) resetInternalState(startPC uint64) {
 	az.currentRelDepth = 0
 	az.minStackDepth = 0
 	az.maxGrowth = 0
-	az.netDelta = 0
 	az.totalGas = 0
 
 	az.resetLastOp()

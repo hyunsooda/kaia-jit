@@ -276,8 +276,8 @@ func opJit(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte
 	nextPC, jitExecuted := interpreter.tryExecuteJitSimple(scope.Contract, scope.Stack, scope.Contract.Input, *pc)
 	// fmt.Println("LLL", *pc, nextPC, time.Since(t))
 	if jitExecuted {
+		// fmt.Printf("JITEXECUTED: %x %x\n", *pc, nextPC)
 		*pc = nextPC - 1
-		// fmt.Println("JITEXECUTED", *pc)
 	}
 	return nil, nil
 }

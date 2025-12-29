@@ -835,9 +835,12 @@ pub extern "C" fn compile_trace(
 
                 // Flow (JUMP, JUMPI - Handled by Go)
                 0x56 => {
+                    // NOTE: if analyzer determines that dynamic jump is allowed, then this `pop`
+                    // behavior is required to make a stack be consistent
                     offset -= 32;
                 }
                 0x57 => {
+                    unimplemented!("JUMPI is not expected");
                     offset -= 64;
                 }
                 0x5b => {}

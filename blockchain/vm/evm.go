@@ -100,6 +100,7 @@ func run(evm *EVM, contract *Contract, input []byte) ([]byte, error) {
 	// 	// ReplaceWithJitTransformation(contract)
 	// 	// fmt.Println("REPLACED")
 	// }
+	// fmt.Println("START")
 	return evm.interpreter.Run(contract, input)
 }
 
