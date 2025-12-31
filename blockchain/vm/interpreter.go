@@ -55,6 +55,7 @@ static void test123(void* func_ptr, void* stack_base);
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"hash"
 	"sync"
@@ -144,6 +145,13 @@ type EVMInterpreter struct {
 
 	jitEngine unsafe.Pointer // Rust JIT 엔진 포인터 (void*)
 	jitOnce   sync.Once      // 스레드 안전한 초기화 보장
+}
+
+func (in *EVMInterpreter) GetJumpTbl() (JumpTable, error) {
+	if in.cfg != nil {
+		return in.cfg.JumpTable, nil
+	}
+	return JumpTable{}, errors.New("no jump table exist")
 }
 
 // initJitEngine: 최초 1회만 실행됨
@@ -736,7 +744,7 @@ func (in *EVMInterpreter) GetJitEngine() unsafe.Pointer {
 // 	return jitData.NextPC, true
 // }
 
-func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, input []byte, pc uint64) (uint64, bool) {
+func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, mem *Memory, input []byte, pc uint64) (uint64, bool) {
 	// t := time.Now()
 	// if pc == 224 {
 	// 	t = time.Now()
@@ -761,8 +769,22 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 	}
 
 	// 4. 가스 차감
+	// constant gas
 	if !contract.UseGas(jitData.TotalGas) {
 		return 0, false
+	}
+	// dynamic gas
+	if jitData.MaxMemoryOff > uint64(mem.Len()) {
+		mem.Resize(jitData.MaxMemoryOff)
+		dynamicCost, err := memoryGasCost(mem, jitData.MaxMemoryOff)
+		if err != nil {
+			// TODO: add log error
+			return 0, false
+		}
+		if !contract.UseGas(dynamicCost) {
+			// TODO: add log error
+			return 0, false
+		}
 	}
 
 	// ---------------------------------------------------------
@@ -774,8 +796,7 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 	currentStackLen := stack.len()
 	neededCap := currentStackLen + jitData.MaxStackGrowth
 	if neededCap > cap(stack.data) {
-		newCap := neededCap + 128 // 여유분 확보
-		newData := make([]uint256.Int, currentStackLen, newCap)
+		newData := make([]uint256.Int, currentStackLen, neededCap)
 		copy(newData, stack.data)
 		stack.data = newData
 	}
@@ -787,13 +808,20 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 		cursorPtr                = unsafe.Pointer(uintptr(stackBase) + uintptr(stack.len())*32)
 		inputPtr  unsafe.Pointer = nil
 		inputLen                 = uint64(len(input))
+		memData                  = mem.Data()
 	)
 	if len(input) > 0 {
 		inputPtr = unsafe.Pointer(&input[0])
 	}
+	var memPtr unsafe.Pointer
+	if len(memData) > 0 {
+		memPtr = unsafe.Pointer(&memData[0])
+	} else {
+		memPtr = nil
+	}
 
 	// t := time.Now()
-	jitcall.Execute(jitData.fnPtr, cursorPtr, inputPtr, inputLen)
+	jitcall.Execute(jitData.fnPtr, cursorPtr, memPtr, inputPtr, inputLen)
 	// fmt.Println("TT", time.Since(t), jitData.NextPC)
 	// C.execute_jit_func(
 	// 	jitData.fnPtr,

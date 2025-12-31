@@ -366,3 +366,10 @@ pub extern "C" fn jit_calldataload(stack_ptr: *mut u64, input_ptr: *const u8, in
         *(stack_ptr as *mut ethnum::U256) = val;
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_debug_print(tag: u64, val: u64) {
+    // tag: 어디서 찍었는지 구분하기 위한 숫자 (예: PC값)
+    // val: 확인하고 싶은 값
+    println!("[JIT DEBUG] Value({:?}):  ({})", tag, val);
+}

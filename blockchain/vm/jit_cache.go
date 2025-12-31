@@ -6,7 +6,6 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/kaiachain/kaia/blockchain/vm/jit"
 	"github.com/kaiachain/kaia/common"
 )
 
@@ -38,11 +37,13 @@ type jitCacheValue struct {
 	fnPtr unsafe.Pointer // Rust JIT 함수 포인터
 
 	// 검증 및 실행용 데이터
-	TotalGas       uint64
-	MinStack       int
-	MaxStackGrowth int
-	NetStackDelta  int
-	NextPC         uint64
+	TotalGas          uint64
+	MinStack          int
+	MaxStackGrowth    int
+	NetStackDelta     int
+	NetStackDeltaList []int
+	MaxMemoryOff      uint64
+	NextPC            uint64
 }
 
 const JIT_FLAG = byte(0xEE)
@@ -71,7 +72,10 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 
 	// 2. 전체 코드 분석 (Batch Analysis)
 	// 0번지부터 시작해서 모든 도달 가능한 JIT 블록을 찾아냄
-	batchResults := jit.AnalyzeTrace(contract.Code, 0)
+	batchResults, err := AnalyzeTrace(contract.Code, 0)
+	if err != nil {
+		return err
+	}
 	analyzedContracts[codeHash] = true
 
 	if len(batchResults) == 0 {
@@ -89,11 +93,6 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 	defer cacheLock.Unlock()
 
 	for startPC, trace := range batchResults {
-
-		if startPC == 55 {
-			continue
-		}
-
 		key := jitCacheKey{codeHash, startPC}
 
 		// 이미 있으면 스킵
@@ -143,12 +142,14 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 
 		// --- Save ---
 		jitCache[key] = &jitCacheValue{
-			fnPtr:          rawPtr,
-			TotalGas:       trace.TotalGas,
-			MinStack:       trace.MinStack,
-			MaxStackGrowth: trace.MaxStackGrowth,
-			NetStackDelta:  trace.NetStackDelta,
-			NextPC:         trace.NextPC,
+			fnPtr:             rawPtr,
+			TotalGas:          trace.TotalGas,
+			MinStack:          trace.MinStack,
+			MaxStackGrowth:    trace.MaxStackGrowth,
+			MaxMemoryOff:      trace.MaxMemoryOff,
+			NetStackDelta:     trace.NetStackDelta,
+			NetStackDeltaList: trace.NetStackDeltaList,
+			NextPC:            trace.NextPC,
 		}
 		compiledCode := make([]byte, len(contract.Code))
 		if len(jitCompiledContracts[*contract.CodeAddr]) == 0 {
@@ -158,25 +159,7 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 		}
 		compiledCode[startPC] = JIT_FLAG
 		jitCompiledContracts[*contract.CodeAddr] = compiledCode
-		fmt.Printf("### %x %x\n", startPC, trace.NextPC)
-
-		// compiledCode := make([]byte, len(contract.Code)+1)
-
-		// var srcCode []byte
-		// if len(jitCompiledContracts[*contract.CodeAddr]) > 0 {
-		// 	srcCode = jitCompiledContracts[*contract.CodeAddr]
-		// } else {
-		// 	srcCode = contract.Code
-		// }
-		// copy(compiledCode[:startPC], srcCode[:startPC])
-		// compiledCode[startPC] = JIT_FLAG
-		// copy(compiledCode[startPC+1:], srcCode[startPC:])
-		// fmt.Printf("### %x %x\n", startPC, trace.NextPC)
-		// jitCompiledContracts[*contract.CodeAddr] = compiledCode
-
-		// if jitCache[key].NextPC > startPC {
-		// 	jitCache[key].NextPC += 1
-		// }
+		fmt.Printf("### %x %x (%x)\n", startPC, trace.NextPC, trace.MaxMemoryOff)
 	}
 
 	return nil

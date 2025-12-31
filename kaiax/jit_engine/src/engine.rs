@@ -51,6 +51,7 @@ pub extern "C" fn new_jit_engine() -> *mut JitEngine {
         };
     }
 
+    // register!("jit_debug_print", jit_debug_print);
     // runtime.rs의 모든 함수 등록
     // register!("jit_add", jit_add);
     // register!("jit_sub", jit_sub);
@@ -254,9 +255,10 @@ pub extern "C" fn compile_trace(
 
     // Function Signature: fn(stack_cursor: *mut u64)
     let ptr_type = module.target_config().pointer_type();
-    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // stack_cursor (param 0)
-    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // input ptr (param 1) [추가]
-    ctx.func.signature.params.push(AbiParam::new(types::I64)); // input length (param 2) [추가]
+    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 0: stack_cursor
+    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 1: memory_ptr [NEW]
+    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 2: input_ptr
+    ctx.func.signature.params.push(AbiParam::new(types::I64)); // 3: input_len
 
     // println!("START!!");
     {
@@ -267,8 +269,9 @@ pub extern "C" fn compile_trace(
 
         let params = builder.block_params(entry);
         let stack_cursor = params[0];
-        let input_ptr = params[1]; // [추가]
-        let input_len = params[2]; // [추가]
+        let memory_ptr = params[1]; // [NEW] EVM Memory Pointer
+        let input_ptr = params[2]; // [추가]
+        let input_len = params[3]; // [추가]
 
         // TODO: remove me
         // // Go에서 넘겨준 Stack Pointer (현재 유효 데이터의 바로 위 = 0점)
@@ -709,6 +712,117 @@ pub extern "C" fn compile_trace(
                 // POP
                 0x50 => {
                     offset -= 32;
+                }
+
+                // MLOAD
+                0x51 => {
+                    let mem = MemFlags::new(); // [누락된 부분 추가]
+
+                    // 1. 오프셋 가져오기
+                    let offset_ptr = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
+                    let mem_offset = builder.ins().load(types::I64, mem, offset_ptr, 0);
+
+                    // 2. 메모리 주소 계산
+                    let src_ptr = builder.ins().iadd(memory_ptr, mem_offset);
+
+                    // 3. Load Big Endian (Mem) -> Bswap -> Store Little Endian (Stack)
+                    // EVM Memory: [MSB(0), Mid2(8), Mid1(16), LSB(24)]
+                    // Stack:      [LSB(0), Mid1(8), Mid2(16), MSB(24)]
+
+                    // Word MSB (Mem+0 -> Stack+24)
+                    let val_msb_be = builder.ins().load(types::I64, mem, src_ptr, 0);
+                    let val_msb = builder.ins().bswap(val_msb_be);
+                    builder.ins().store(mem, val_msb, offset_ptr, 24);
+
+                    // Word Mid2 (Mem+8 -> Stack+16)
+                    let val_mid2_be = builder.ins().load(types::I64, mem, src_ptr, 8);
+                    let val_mid2 = builder.ins().bswap(val_mid2_be);
+                    builder.ins().store(mem, val_mid2, offset_ptr, 16);
+
+                    // Word Mid1 (Mem+16 -> Stack+8)
+                    let val_mid1_be = builder.ins().load(types::I64, mem, src_ptr, 16);
+                    let val_mid1 = builder.ins().bswap(val_mid1_be);
+                    builder.ins().store(mem, val_mid1, offset_ptr, 8);
+
+                    // Word LSB (Mem+24 -> Stack+0)
+                    let val_lsb_be = builder.ins().load(types::I64, mem, src_ptr, 24);
+                    let val_lsb = builder.ins().bswap(val_lsb_be);
+                    builder.ins().store(mem, val_lsb, offset_ptr, 0);
+                    // offset 변화 없음 (Pop 1, Push 1)
+                    // {
+                    //     let dbg_fid = get_runtime_func(module, funcs, "jit_debug_print", 2);
+                    //     let dbg_ref = module.declare_func_in_func(dbg_fid, builder.func);
+                    //     let tag = builder.ins().iconst(types::I64, 1); // 식별용 태그
+                    //     builder.ins().call(dbg_ref, &[tag, mem_offset]); // jit_debug_print(tag, res[0])
+                    //     println!("MLOAD CALLED")
+                    // }
+                }
+
+                // MSTORE
+                0x52 => {
+                    // Stack: [..., value, offset] -> [...]
+                    // offset: Top(offset-32)
+                    // value:  Second(offset-64)
+
+                    // 1. 오프셋 및 값 포인터
+                    let off_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
+                    let val_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
+
+                    let mem = MemFlags::new();
+                    let mem_offset = builder.ins().load(types::I64, mem, off_ptr_stack, 0);
+                    let dst_ptr = builder.ins().iadd(memory_ptr, mem_offset);
+
+                    // 2. 스택 값 로드 (Little Endian)
+                    let val_lsb = builder.ins().load(types::I64, mem, val_ptr_stack, 0);
+                    let val_mid1 = builder.ins().load(types::I64, mem, val_ptr_stack, 8);
+                    let val_mid2 = builder.ins().load(types::I64, mem, val_ptr_stack, 16);
+                    let val_msb = builder.ins().load(types::I64, mem, val_ptr_stack, 24);
+
+                    // 3. 변환 및 메모리 저장 (Little Endian Stack -> Big Endian Mem)
+
+                    // Stack MSB -> Memory + 0
+                    let val_msb_be = builder.ins().bswap(val_msb);
+                    builder.ins().store(mem, val_msb_be, dst_ptr, 0);
+
+                    // Stack Mid2 -> Memory + 8
+                    let val_mid2_be = builder.ins().bswap(val_mid2);
+                    builder.ins().store(mem, val_mid2_be, dst_ptr, 8);
+
+                    // Stack Mid1 -> Memory + 16
+                    let val_mid1_be = builder.ins().bswap(val_mid1);
+                    builder.ins().store(mem, val_mid1_be, dst_ptr, 16);
+
+                    // Stack LSB -> Memory + 24
+                    let val_lsb_be = builder.ins().bswap(val_lsb);
+                    builder.ins().store(mem, val_lsb_be, dst_ptr, 24);
+
+                    offset -= 64; // Pop 2
+
+                    // {
+                    //     let dbg_fid = get_runtime_func(module, funcs, "jit_debug_print", 2);
+                    //     let dbg_ref = module.declare_func_in_func(dbg_fid, builder.func);
+                    //     let tag = builder.ins().iconst(types::I64, 2); // 식별용 태그
+                    //     builder.ins().call(dbg_ref, &[tag, mem_offset]); // jit_debug_print(tag, res[0])
+                    //     println!("MSTORE CALLED: {:?} ", current_real_pc)
+                    // }
+                }
+
+                // MSTORE8
+                0x53 => {
+                    let mem = MemFlags::new(); // [누락된 부분 추가]
+
+                    let off_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
+                    let val_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
+
+                    let mem_offset = builder.ins().load(types::I64, mem, off_ptr_stack, 0);
+                    let dst_ptr = builder.ins().iadd(memory_ptr, mem_offset);
+
+                    // [최적화] Stack LSB(+0)에서 바로 1바이트 로드 (i8)
+                    let val_byte = builder.ins().load(types::I8, mem, val_ptr_stack, 0);
+
+                    builder.ins().store(mem, val_byte, dst_ptr, 0);
+
+                    offset -= 64; // Pop 2
                 }
 
                 // PUSH0

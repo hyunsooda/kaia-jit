@@ -1,4 +1,4 @@
-package jit
+package vm
 
 // JIT 대상 Opcode들의 가스비 (EVM 스펙 기준)
 // 실제 Geth에서는 protocol_params.go 등에 정의되어 있으나, JIT용으로 최적화된 테이블 정의
@@ -35,6 +35,10 @@ var jitGasTable = [256]uint64{
 	// PUSH1~32 (3)
 	// DUP1~16 (3)
 	// SWAP1~16 (3)
+
+	0x51: 3,
+	0x52: 3,
+	0x53: 3,
 
 	// Flow
 	0x56: 8,  // JUMP (Mid)
