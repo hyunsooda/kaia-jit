@@ -30,7 +30,9 @@ pub struct JitEngine {
 pub extern "C" fn new_jit_engine() -> *mut JitEngine {
     let mut flag_builder = settings::builder();
     flag_builder.set("use_colocated_libcalls", "false").unwrap();
-    flag_builder.set("is_pic", "true").unwrap();
+    // As we're statically linking the JIT binary from Kaia(Golang), setting the PIC `false` is
+    // safe
+    flag_builder.set("is_pic", "false").unwrap();
 
     let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
         panic!("host machine is not supported: {}", msg);
@@ -256,9 +258,10 @@ pub extern "C" fn compile_trace(
     // Function Signature: fn(stack_cursor: *mut u64)
     let ptr_type = module.target_config().pointer_type();
     ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 0: stack_cursor
-    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 1: memory_ptr [NEW]
-    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 2: input_ptr
-    ctx.func.signature.params.push(AbiParam::new(types::I64)); // 3: input_len
+    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 1: memory_ptr
+    ctx.func.signature.params.push(AbiParam::new(types::I64)); // 2: memory_len [NEW!]
+    ctx.func.signature.params.push(AbiParam::new(ptr_type)); // 3: input_ptr
+    ctx.func.signature.params.push(AbiParam::new(types::I64)); // 4: input_len
 
     // println!("START!!");
     {
@@ -268,10 +271,12 @@ pub extern "C" fn compile_trace(
         builder.switch_to_block(entry);
 
         let params = builder.block_params(entry);
+
         let stack_cursor = params[0];
-        let memory_ptr = params[1]; // [NEW] EVM Memory Pointer
-        let input_ptr = params[2]; // [추가]
-        let input_len = params[3]; // [추가]
+        let memory_ptr = params[1];
+        let memory_len = params[2]; // [NEW!] 현재 메모리 크기 (u64)
+        let input_ptr = params[3];
+        let input_len = params[4];
 
         // TODO: remove me
         // // Go에서 넘겨준 Stack Pointer (현재 유효 데이터의 바로 위 = 0점)
@@ -716,7 +721,9 @@ pub extern "C" fn compile_trace(
 
                 // MLOAD
                 0x51 => {
-                    let mem = MemFlags::new(); // [누락된 부분 추가]
+                    // Stack: [..., offset] -> [..., value]
+
+                    let mem = MemFlags::new();
 
                     // 1. 오프셋 가져오기
                     let offset_ptr = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
@@ -725,29 +732,21 @@ pub extern "C" fn compile_trace(
                     // 2. 메모리 주소 계산
                     let src_ptr = builder.ins().iadd(memory_ptr, mem_offset);
 
-                    // 3. Load Big Endian (Mem) -> Bswap -> Store Little Endian (Stack)
-                    // EVM Memory: [MSB(0), Mid2(8), Mid1(16), LSB(24)]
-                    // Stack:      [LSB(0), Mid1(8), Mid2(16), MSB(24)]
+                    // 3. [최적화] 128비트 단위로 로드 (2번만 수행)
+                    // EVM Memory (Big Endian): [High 128bit (MSB)] [Low 128bit (LSB)]
+                    // Stack (Little Endian):   [Low 128bit (LSB)]  [High 128bit (MSB)]
 
-                    // Word MSB (Mem+0 -> Stack+24)
-                    let val_msb_be = builder.ins().load(types::I64, mem, src_ptr, 0);
-                    let val_msb = builder.ins().bswap(val_msb_be);
-                    builder.ins().store(mem, val_msb, offset_ptr, 24);
+                    // (1) High Part (MSB): Memory + 0  -> Stack + 16
+                    // load.i128은 x86에서 XMM 레지스터를 사용 (SSE/AVX)
+                    let val_msb_be = builder.ins().load(types::I128, mem, src_ptr, 0);
+                    let val_msb = builder.ins().bswap(val_msb_be); // 128비트 전체 byte swap (PSHUFB 등으로 변환됨)
+                    builder.ins().store(mem, val_msb, offset_ptr, 16);
 
-                    // Word Mid2 (Mem+8 -> Stack+16)
-                    let val_mid2_be = builder.ins().load(types::I64, mem, src_ptr, 8);
-                    let val_mid2 = builder.ins().bswap(val_mid2_be);
-                    builder.ins().store(mem, val_mid2, offset_ptr, 16);
-
-                    // Word Mid1 (Mem+16 -> Stack+8)
-                    let val_mid1_be = builder.ins().load(types::I64, mem, src_ptr, 16);
-                    let val_mid1 = builder.ins().bswap(val_mid1_be);
-                    builder.ins().store(mem, val_mid1, offset_ptr, 8);
-
-                    // Word LSB (Mem+24 -> Stack+0)
-                    let val_lsb_be = builder.ins().load(types::I64, mem, src_ptr, 24);
+                    // (2) Low Part (LSB): Memory + 16 -> Stack + 0
+                    let val_lsb_be = builder.ins().load(types::I128, mem, src_ptr, 16);
                     let val_lsb = builder.ins().bswap(val_lsb_be);
                     builder.ins().store(mem, val_lsb, offset_ptr, 0);
+
                     // offset 변화 없음 (Pop 1, Push 1)
                     // {
                     //     let dbg_fid = get_runtime_func(module, funcs, "jit_debug_print", 2);
@@ -760,41 +759,27 @@ pub extern "C" fn compile_trace(
 
                 // MSTORE
                 0x52 => {
-                    // Stack: [..., value, offset] -> [...]
-                    // offset: Top(offset-32)
-                    // value:  Second(offset-64)
+                    // Stack: [..., value, offset]
 
-                    // 1. 오프셋 및 값 포인터
+                    let mem = MemFlags::new();
+
                     let off_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
                     let val_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
 
-                    let mem = MemFlags::new();
                     let mem_offset = builder.ins().load(types::I64, mem, off_ptr_stack, 0);
                     let dst_ptr = builder.ins().iadd(memory_ptr, mem_offset);
 
-                    // 2. 스택 값 로드 (Little Endian)
-                    let val_lsb = builder.ins().load(types::I64, mem, val_ptr_stack, 0);
-                    let val_mid1 = builder.ins().load(types::I64, mem, val_ptr_stack, 8);
-                    let val_mid2 = builder.ins().load(types::I64, mem, val_ptr_stack, 16);
-                    let val_msb = builder.ins().load(types::I64, mem, val_ptr_stack, 24);
+                    // [최적화] Stack(Little) -> Bswap -> Memory(Big)
 
-                    // 3. 변환 및 메모리 저장 (Little Endian Stack -> Big Endian Mem)
-
-                    // Stack MSB -> Memory + 0
+                    // (1) High Part: Stack + 16 -> Memory + 0
+                    let val_msb = builder.ins().load(types::I128, mem, val_ptr_stack, 16);
                     let val_msb_be = builder.ins().bswap(val_msb);
                     builder.ins().store(mem, val_msb_be, dst_ptr, 0);
 
-                    // Stack Mid2 -> Memory + 8
-                    let val_mid2_be = builder.ins().bswap(val_mid2);
-                    builder.ins().store(mem, val_mid2_be, dst_ptr, 8);
-
-                    // Stack Mid1 -> Memory + 16
-                    let val_mid1_be = builder.ins().bswap(val_mid1);
-                    builder.ins().store(mem, val_mid1_be, dst_ptr, 16);
-
-                    // Stack LSB -> Memory + 24
+                    // (2) Low Part: Stack + 0  -> Memory + 16
+                    let val_lsb = builder.ins().load(types::I128, mem, val_ptr_stack, 0);
                     let val_lsb_be = builder.ins().bswap(val_lsb);
-                    builder.ins().store(mem, val_lsb_be, dst_ptr, 24);
+                    builder.ins().store(mem, val_lsb_be, dst_ptr, 16);
 
                     offset -= 64; // Pop 2
 
@@ -823,6 +808,26 @@ pub extern "C" fn compile_trace(
                     builder.ins().store(mem, val_byte, dst_ptr, 0);
 
                     offset -= 64; // Pop 2
+                }
+
+                // MSIZE
+                0x59 => {
+                    // Stack: [] -> [size] (Push 1)
+                    let ptr = builder.ins().iadd_imm(stack_cursor, offset as i64);
+                    let mem = MemFlags::new();
+                    let zero = builder.ins().iconst(types::I64, 0);
+
+                    // 1. memory_len (u64) 저장 (Little Endian LSB)
+                    // EVM은 32바이트 word 단위가 아니라 바이트 단위 크기를 반환합니다.
+                    // (Go Runtime에서 evm.Memory.Len() 값을 넘겨줬다고 가정)
+                    builder.ins().store(mem, memory_len, ptr, 0);
+
+                    // 2. 나머지 상위 24바이트 0으로 채우기
+                    builder.ins().store(mem, zero, ptr, 8);
+                    builder.ins().store(mem, zero, ptr, 16);
+                    builder.ins().store(mem, zero, ptr, 24);
+
+                    offset += 32;
                 }
 
                 // PUSH0
@@ -1275,10 +1280,10 @@ pub extern "C" fn compile_trace(
 
     engine.counter += 1;
 
-    //     {
-    //         let func_name = format!("trace_{}", engine.counter);
-    //         dump_cranelift_ir(&ctx.func, &func_name);
-    //     }
+    // {
+    //     let func_name = format!("trace_{}", engine.counter);
+    //     dump_cranelift_ir(&ctx.func, &func_name);
+    // }
 
     let id = engine
         .module
@@ -1293,10 +1298,10 @@ pub extern "C" fn compile_trace(
     engine.module.clear_context(ctx);
     engine.module.finalize_definitions().unwrap();
 
-    //     {
-    //         let code_ptr = engine.module.get_finalized_function(id);
-    //         dump::dump_machine_code(code_ptr, code_len);
-    //     }
+    {
+        let code_ptr = engine.module.get_finalized_function(id);
+        dump::dump_machine_code(code_ptr, code_len);
+    }
     engine.module.get_finalized_function(id)
 }
 
@@ -1305,12 +1310,15 @@ pub extern "C" fn compile_trace(
 pub extern "C" fn execute_jit_func(
     ptr: *const u8,
     stack_cursor: *mut u64,
+    mem_ptr: *mut u64,
+    mem_len: u64,
     input_ptr: *const u8,
     input_len: u64,
 ) {
     unsafe {
-        let func = std::mem::transmute::<_, extern "C" fn(*mut u64, *const u8, u64)>(ptr);
-        func(stack_cursor, input_ptr, input_len);
+        let func =
+            std::mem::transmute::<_, extern "C" fn(*mut u64, *mut u64, u64, *const u8, u64)>(ptr);
+        func(stack_cursor, mem_ptr, mem_len, input_ptr, input_len);
     }
 }
 

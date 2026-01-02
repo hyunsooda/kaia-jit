@@ -159,7 +159,7 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 		}
 		compiledCode[startPC] = JIT_FLAG
 		jitCompiledContracts[*contract.CodeAddr] = compiledCode
-		fmt.Printf("### %x %x (%x)\n", startPC, trace.NextPC, trace.MaxMemoryOff)
+		// fmt.Printf("### %x %x (%x)\n", startPC, trace.NextPC, trace.MaxMemoryOff)
 	}
 
 	return nil

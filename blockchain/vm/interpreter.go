@@ -41,13 +41,13 @@ long long execute_jit_func_test(void* func_ptr, long long a, long long b) {
 
 
 
-typedef void (*jit_generated_func_t)(uint64_t* stack_base, const uint8_t* input_ptr, uint64_t input_len);
+typedef void (*jit_generated_func_t)(uint64_t* stack_base, uint64_t* mem_base, uint64_t mem_len, const uint8_t* input_ptr, uint64_t input_len);
 
-static void execute_jit_func(void* func_ptr, void* stack_base, void* input_ptr, uint64_t input_len) {
+static void execute_jit_func(void* func_ptr, void* stack_base, void* mem_base, uint64_t mem_len, void* input_ptr, uint64_t input_len) {
     jit_generated_func_t jit_fn = (jit_generated_func_t)func_ptr;
 
     // Rust JIT 함수 호출
-    jit_fn((uint64_t*)stack_base, (const uint8_t*)input_ptr, input_len);
+    jit_fn((uint64_t*)stack_base, (uint64_t*)mem_base, mem_len, (const uint8_t*)input_ptr, input_len);
 }
 
 static void test123(void* func_ptr, void* stack_base);
@@ -808,31 +808,37 @@ func (in *EVMInterpreter) tryExecuteJitSimple(contract *Contract, stack *Stack, 
 		cursorPtr                = unsafe.Pointer(uintptr(stackBase) + uintptr(stack.len())*32)
 		inputPtr  unsafe.Pointer = nil
 		inputLen                 = uint64(len(input))
+		memPtr    unsafe.Pointer = nil
 		memData                  = mem.Data()
+		memLen                   = uint64(mem.Len())
 	)
 	if len(input) > 0 {
 		inputPtr = unsafe.Pointer(&input[0])
 	}
-	var memPtr unsafe.Pointer
 	if len(memData) > 0 {
 		memPtr = unsafe.Pointer(&memData[0])
-	} else {
-		memPtr = nil
 	}
 
 	// t := time.Now()
-	jitcall.Execute(jitData.fnPtr, cursorPtr, memPtr, inputPtr, inputLen)
+	jitcall.Execute(
+		jitData.fnPtr,
+		cursorPtr,
+		memPtr,
+		memLen,
+		inputPtr,
+		inputLen,
+	)
+
 	// fmt.Println("TT", time.Since(t), jitData.NextPC)
 	// C.execute_jit_func(
 	// 	jitData.fnPtr,
 	// 	cursorPtr,
+	// 	memPtr,
+	// 	C.uint64_t(memLen),
 	// 	inputPtr,
-	// 	inputLen,
+	// 	C.uint64_t(inputLen),
 	// )
 	newLen := currentStackLen + jitData.NetStackDelta
 	stack.data = stack.data[:newLen]
-	// if jitData.NextPC == 233 {
-	// 	fmt.Println("@@@@@@@@@@@@@", time.Since(t), pc)
-	// }
 	return jitData.NextPC, true
 }
