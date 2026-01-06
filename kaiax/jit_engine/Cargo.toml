@@ -15,6 +15,7 @@ target-lexicon = "0.12.0"
 cranelift-native = "0.108.0"
 ethnum = "1.5.2"
 capstone = "0.13.0"
+tiny-keccak = {version = "2.0.2", features = ["keccak"]}
 
 [profile.release]
 opt-level = 3       # 최고 수준 최적화

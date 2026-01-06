@@ -1,5 +1,7 @@
 package vm
 
+import "github.com/kaiachain/kaia/params"
+
 // JIT 대상 Opcode들의 가스비 (EVM 스펙 기준)
 // 실제 Geth에서는 protocol_params.go 등에 정의되어 있으나, JIT용으로 최적화된 테이블 정의
 var jitGasTable = [256]uint64{
@@ -18,6 +20,9 @@ var jitGasTable = [256]uint64{
 	// Comparison (Very Low: 3)
 	0x10: 3, 0x11: 3, 0x12: 3, 0x13: 3, 0x14: 3, 0x15: 3, // LT, GT... ISZERO
 	0x16: 3, 0x17: 3, 0x18: 3, 0x19: 3, // AND, OR, XOR, NOT...
+
+	// SHA3
+	0x20: params.Sha3Gas,
 
 	0x1a: 3, // BYTE (추가)
 	0x1b: 3, // SHL  (추가)

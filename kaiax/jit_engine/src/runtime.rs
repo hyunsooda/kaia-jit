@@ -1,5 +1,6 @@
 use ethnum::{I256, U256};
 use std::slice;
+use tiny_keccak::{Hasher, Keccak};
 
 // ============================================================================
 // [ Arithmetic Operations ]
@@ -7,11 +8,9 @@ use std::slice;
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_add(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // ADD: Stack[0] + Stack[1]
     let top = *ptr_top;
     let second = *ptr_result_and_second;
 
-    // 결과는 두 번째 위치(Top-1)에 덮어씀
     *ptr_result_and_second = top.wrapping_add(second);
 }
 
@@ -92,9 +91,6 @@ pub unsafe extern "C" fn jit_smod(ptr_result_and_second: *mut I256, ptr_top: *co
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_signextend(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // SIGNEXTEND(byte_num, value)
-    // Stack[0]: byte_num (확장할 바이트 위치)
-    // Stack[1]: value    (값)
     let byte_num = *ptr_top;
     let value = *ptr_result_and_second;
 
@@ -115,9 +111,8 @@ pub unsafe extern "C" fn jit_signextend(ptr_result_and_second: *mut U256, ptr_to
 }
 
 // ============================================================================
-// [ Ternary Operations (인자 3개) ]
+// [ Ternary Operations
 // ============================================================================
-// 순서: Stack[0] (Top), Stack[1] (Mid), Stack[2] (Bottom/Result)
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_addmod(
@@ -167,19 +162,15 @@ pub unsafe extern "C" fn jit_mulmod(
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_lt(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // LT: Stack[0] < Stack[1]
     let top = *ptr_top;
     let second = *ptr_result_and_second;
-
     *ptr_result_and_second = if top < second { U256::ONE } else { U256::ZERO };
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_gt(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // GT: Stack[0] > Stack[1]
     let top = *ptr_top;
     let second = *ptr_result_and_second;
-
     *ptr_result_and_second = if top > second { U256::ONE } else { U256::ZERO };
 }
 
@@ -187,8 +178,6 @@ pub unsafe extern "C" fn jit_gt(ptr_result_and_second: *mut U256, ptr_top: *cons
 pub unsafe extern "C" fn jit_slt(ptr_result_and_second: *mut I256, ptr_top: *const I256) {
     let top = *ptr_top;
     let second = *ptr_result_and_second;
-
-    // boolean true=1, false=0
     *ptr_result_and_second = if top < second { I256::ONE } else { I256::ZERO };
 }
 
@@ -196,7 +185,6 @@ pub unsafe extern "C" fn jit_slt(ptr_result_and_second: *mut I256, ptr_top: *con
 pub unsafe extern "C" fn jit_sgt(ptr_result_and_second: *mut I256, ptr_top: *const I256) {
     let top = *ptr_top;
     let second = *ptr_result_and_second;
-
     *ptr_result_and_second = if top > second { I256::ONE } else { I256::ZERO };
 }
 
@@ -204,14 +192,11 @@ pub unsafe extern "C" fn jit_sgt(ptr_result_and_second: *mut I256, ptr_top: *con
 pub unsafe extern "C" fn jit_eq(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
     let top = *ptr_top;
     let second = *ptr_result_and_second;
-
     *ptr_result_and_second = if top == second { U256::ONE } else { U256::ZERO };
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_iszero(ptr_top: *mut U256) {
-    // ISZERO: Stack[0] == 0
-    // (인자가 1개이므로 ptr_top 위치에 바로 덮어씀)
     let top = *ptr_top;
     *ptr_top = if top == U256::ZERO {
         U256::ONE
@@ -267,9 +252,6 @@ pub unsafe extern "C" fn jit_byte(ptr_result_and_second: *mut U256, ptr_top: *co
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_shl(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // SHL(shift, value)
-    // Stack[0]: shift
-    // Stack[1]: value
     let shift = *ptr_top;
     let value = *ptr_result_and_second;
 
@@ -282,7 +264,6 @@ pub unsafe extern "C" fn jit_shl(ptr_result_and_second: *mut U256, ptr_top: *con
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_shr(ptr_result_and_second: *mut U256, ptr_top: *const U256) {
-    // SHR(shift, value)
     let shift = *ptr_top;
     let value = *ptr_result_and_second;
 
@@ -365,6 +346,32 @@ pub extern "C" fn jit_calldataload(stack_ptr: *mut u64, input_ptr: *const u8, in
         let val = ethnum::U256::from_be_bytes(buf);
         *(stack_ptr as *mut ethnum::U256) = val;
     }
+}
+
+/// JIT SHA3 Runtime Function
+#[no_mangle]
+pub unsafe extern "C" fn jit_sha3(
+    dst_size_ptr: *mut U256,
+    offset_ptr: *const U256,
+    mem_base: *const u8,
+) {
+    let offset = *offset_ptr;
+    let size = *dst_size_ptr;
+
+    let data = if size == U256::ZERO {
+        &[]
+    } else {
+        let off = offset.as_usize();
+        let len = size.as_usize();
+        slice::from_raw_parts(mem_base.add(off), len)
+    };
+
+    let mut hasher = Keccak::v256();
+    let mut output = [0u8; 32];
+    hasher.update(data);
+    hasher.finalize(&mut output);
+
+    *dst_size_ptr = U256::from_be_bytes(output);
 }
 
 #[no_mangle]

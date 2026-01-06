@@ -3,64 +3,63 @@ package vm
 import (
 	"encoding/binary"
 	"fmt"
-	"math/big"
 	"slices"
 	"strings"
+
+	"github.com/holiman/uint256"
+	"github.com/kaiachain/kaia/common/math"
+	"github.com/kaiachain/kaia/params"
 )
 
 // --- [1] 데이터 구조 정의 ---
 
-type CodeSegment struct {
+type codeSegment struct {
 	Offset uint64
 	Length uint64
 }
 
 type JitTraceResult struct {
-	CanJit            bool
-	Segments          []CodeSegment
-	NetStackDelta     int // 최종 스택 변화량
+	Segments          []codeSegment
+	NetStackDelta     int //  Final stack delta
 	NetStackDeltaList []int
-	MinStack          int
-	MaxStackGrowth    int // 최대 스택 증가량 (Cap 확보용)
+	MinStack          int // Minimum stack growth
+	MaxStackGrowth    int // Maximum stack growth (for `cap()`)
 	MaxMemoryOff      uint64
-	TotalGas          uint64 // [추가] 이 Trace를 실행하는 데 필요한 총 가스비
+	TotalGas          uint64
 	NextPC            uint64
 }
 
-// Opcode 정보를 담는 메타 데이터
 type opInfo struct {
 	pops, pushes int
 	isSupported  bool
-	isStaticPush bool // PUSH0 ~ PUSH32 여부
+	isStaticPush bool // PUSH1 ~ PUSH32
 }
 
 type analysisSlot struct {
-	isStatic bool     // PUSH로 만든 상수인가?
-	val      *big.Int // 상수값
+	isStatic bool
+	val      *uint256.Int
 }
 
-type MemAnalysisSlot struct {
+type memAnalysisSlot struct {
 	isStatic bool
 	off      uint64
-	val      *big.Int
+	length   uint64
+	val      *uint256.Int
 }
-
-// --- [2] 분석기 상태 관리 (State Machine) ---
 
 type traceAnalyzer struct {
 	code     []byte
 	pc       uint64
 	startPC  uint64
-	segments []CodeSegment
+	segments []codeSegment
 
-	// [추가] 분석 결과 저장소 (여기에 모아서 반환함)
 	results BatchAnalysisResult
 
 	jumpTargets map[uint64]uint64
 	blockStacks map[string][]analysisSlot
 
-	memSlot   map[uint64]MemAnalysisSlot
-	blockMems map[string]map[uint64]MemAnalysisSlot
+	memSlot   map[uint64]memAnalysisSlot
+	blockMems map[string]map[uint64]memAnalysisSlot
 
 	maxMemoryOff uint64
 
@@ -68,20 +67,20 @@ type traceAnalyzer struct {
 
 	jumpDests BitVec
 
-	// 스택 상태 추적
+	// Track stack diff
 	currentRelDepth int
 	minStackDepth   int
 	maxGrowth       int
 	totalGas        uint64
 
-	// 현재 세그먼트 추적
+	// Track current segment
 	segOffset uint64
 	segLen    uint64
 
-	// Static Jump 분석용 (직전 명령어 기억)
+	// Metadata for static jump analysis (PUSH + JUMP)
 	lastOp       byte
-	lastPushData []byte // PUSH된 데이터 (JUMP 목적지 후보)
-	lastInstSize uint64 // 직전 명령어 길이 (Fusion시 삭제용)
+	lastPushData []byte
+	lastInstSize uint64
 
 	worklist []uint64
 }
@@ -92,16 +91,14 @@ func newTraceAnalyzer(code []byte, pc uint64) *traceAnalyzer {
 		jumpDests:    codeBitmap(code),
 		jumpTargets:  make(map[uint64]uint64),
 		blockStacks:  make(map[string][]analysisSlot),
-		memSlot:      make(map[uint64]MemAnalysisSlot),
-		blockMems:    make(map[string]map[uint64]MemAnalysisSlot),
+		memSlot:      make(map[uint64]memAnalysisSlot),
+		blockMems:    make(map[string]map[uint64]memAnalysisSlot),
 		visited:      make(map[uint64]bool),
 		results:      make(BatchAnalysisResult),
 		maxMemoryOff: 0,
 		worklist:     []uint64{pc},
 	}
 }
-
-// --- [3] 메인 분석 함수 ---
 
 func AnalyzeTrace(code []byte, pc uint64) (BatchAnalysisResult, error) {
 	// TODO: if hardfork is scheduled, jump table might need to be re-calcaulated
@@ -125,28 +122,50 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	gas := jitGasTable[op]
 	// TODO: 0x5f condition is for hardfork-awareness.
 	if gas == 0 && op != 0x00 && op != 0x5f {
-		// 테이블에 0으로 되어있는데 STOP(0x00)이 아니면,
-		// 우리가 가스비를 정의 안 한 미지원 Opcode일 수 있음 -> 안전하게 JIT 포기
-		// (PUSH0 같은 0 cost opcode 제외)
-		// 하지만 여기선 PUSH0도 2gas이므로 gas==0이면 미지원으로 간주 가능
+		// If the gas cost is 0 in the table but the opcode is not STOP (0x00),
+		// it may be an unsupported opcode with an undefined gas cost.
+		// To be safe, we abort JIT compilation in this case.
+		// (Note: Since PUSH0 is assigned a 2-gas cost here, any gas == 0 can be treated as unsupported.)
 		return false
 	}
+
+	// SHA3 (0x20) 추가 가스비 (Word Cost)
+	if op == 0x20 {
+		if slot, exists := az.memSlot[az.pc]; exists && slot.isStatic {
+			// toWordSize: (len + 31) / 32
+			wordCount := toWordSize(slot.length)
+			// 6 * wordCount
+			extraGas, overflow := math.SafeMul(wordCount, params.Sha3WordGas)
+			if overflow {
+				return false
+			}
+			// 기본 가스에 추가
+			gas, overflow = math.SafeAdd(gas, extraGas)
+			if overflow {
+				return false
+			}
+		} else {
+			// SHA3인데 길이가 동적이면 JIT 불가
+			return false
+		}
+	}
+
 	az.totalGas += gas
 
-	// 2. 스택 시뮬레이션 (메모리 안전용)
+	// 2. Track stack delta
 	az.currentRelDepth -= info.pops
-	// [Check] 지금 바닥을 뚫었나? (최저점 갱신)
+	// [Check] Hit a new low? (New floor)
 	if az.currentRelDepth < az.minStackDepth {
 		az.minStackDepth = az.currentRelDepth
 	}
 
 	az.currentRelDepth += info.pushes
-	// [Check] 지금 천장을 뚫었나? (최고점 갱신)
+	// [Check] Hit a new high? (New ceiling)
 	if az.currentRelDepth > az.maxGrowth {
 		az.maxGrowth = az.currentRelDepth
 	}
 
-	// 3. PC 이동 계산
+	// 3. Calculate next PC (i.e., consider the size of the `PUSH` data)
 	instSize := uint64(1)
 	var pushData []byte
 
@@ -161,7 +180,7 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 		pushData = az.code[az.pc+1 : az.pc+instSize]
 	}
 
-	// 3. 상태 업데이트
+	// 3. Update the stack tracking metadata
 	az.lastOp = op
 	az.lastInstSize = instSize
 	az.lastPushData = pushData
@@ -174,17 +193,15 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 
 func (az *traceAnalyzer) finishSegment() {
 	if az.segLen > 0 {
-		az.segments = append(az.segments, CodeSegment{
+		az.segments = append(az.segments, codeSegment{
 			Offset: az.segOffset,
 			Length: az.segLen,
 		})
 	}
 }
 
-// --- [5] 헬퍼 메서드 ---
-
 func (az *traceAnalyzer) isLastOpPush() bool {
-	// PUSH0(0x5f) 또는 PUSH1~32(0x60~0x7f)
+	// PUSH0 or PUSH1-32
 	return az.lastOp == 0x5f || (az.lastOp >= 0x60 && az.lastOp <= 0x7f)
 }
 
@@ -195,12 +212,11 @@ func (az *traceAnalyzer) resetLastOp() {
 }
 
 func (az *traceAnalyzer) getDestIfValid(data []byte) (uint64, bool) {
-	// 1. 빈 데이터 (PUSH0)
 	if len(data) == 0 {
 		return 0, true
 	}
 
-	// 2. 앞쪽 0 제거 (Trim Leading Zeros)
+	// Trim Leading Zeros
 	// ex: [00, 00, 05] -> [05]
 	// ex: [FF, ... ] -> [FF, ... ]
 	start := 0
@@ -209,16 +225,11 @@ func (az *traceAnalyzer) getDestIfValid(data []byte) (uint64, bool) {
 	}
 	trimmed := data[start:]
 
-	// 3. [Check 1] 값이 코드 길이보다 큰가?
-
-	// 3-A: 유효 숫자 길이가 8바이트보다 길면?
-	// -> uint64 최대값보다 큰 수라는 뜻.
-	// -> 당연히 코드 길이(최대 24KB)보다 훨씬 큼. -> 탈락!
+	// valid jumpdest never be exceed of the valid value within 8 byte
 	if len(trimmed) > 8 {
 		return 0, false
 	}
 
-	// 3-B: 8바이트 이하면 uint64로 변환해서 직접 비교
 	var buf [8]byte
 	copy(buf[8-len(trimmed):], trimmed)
 	val := binary.BigEndian.Uint64(buf[:])
@@ -230,16 +241,13 @@ func (az *traceAnalyzer) getDestIfValid(data []byte) (uint64, bool) {
 	return val, true
 }
 
-// getOpInfo: Opcode별 스펙 정의 (Single Source of Truth)
 func getOpInfo(op byte) opInfo {
-	// jitGasTable은 패키지 레벨 변수로 정의되어 있다고 가정
+	// if no gas is specified, it's unsupported opcode
 	if jitGasTable[op] == 0 {
 		return opInfo{isSupported: false}
 	}
 
 	switch {
-	// --- PUSH Operations (isStaticPush = true) ---
-
 	// PUSH0 (Shanghai)
 	case op == 0x5f:
 		return opInfo{0, 1, true, true}
@@ -265,26 +273,26 @@ func getOpInfo(op byte) opInfo {
 	// --- Arithmetic / Logic / Comparison ---
 	// 0x01~0x0b (Arith), 0x10~0x1d (Cmp/Bitwise)
 	case (op >= 0x01 && op <= 0x0b) || (op >= 0x10 && op <= 0x1d):
-		// EXP(0x0a)는 제외 (Dynamic Gas)
+		// No suupoort of `Exp` opcode due to the dynamic cost
 		if op == 0x0a {
 			return opInfo{isSupported: false}
 		}
 
-		// 인자가 1개인 연산 (Pop 1, Push 1)
 		// ISZERO(0x15), NOT(0x19)
 		if op == 0x15 || op == 0x19 {
 			return opInfo{1, 1, true, false}
 		}
 
-		// 인자가 3개인 연산 (Pop 3, Push 1)
 		// ADDMOD(0x08), MULMOD(0x09)
 		if op == 0x08 || op == 0x09 {
 			return opInfo{3, 1, true, false}
 		}
 
-		// 나머지는 전부 이항 연산 (Pop 2, Push 1)
 		// ADD, MUL, SUB, DIV, SDIV, MOD, SMOD, SIGNEXTEND
 		// LT, GT, SLT, SGT, EQ, AND, OR, XOR, BYTE, SHL, SHR, SAR
+		return opInfo{2, 1, true, false}
+
+	case op == 0x20:
 		return opInfo{2, 1, true, false}
 
 	// ---  Environmental Information (CallData) ---
@@ -300,10 +308,11 @@ func getOpInfo(op byte) opInfo {
 	case op == 0x36:
 		return opInfo{0, 1, true, false}
 
-		// MEMORY
+	// MEMORY
 	case op == 0x51: // MLOAD
 		return opInfo{1, 1, true, false}
-	case op == 0x52 || op == 0x53: // MSTORE, MSTORE8
+	// MSTORE, MSTORE8
+	case op == 0x52 || op == 0x53:
 		return opInfo{2, 0, true, false}
 
 	// --- Flow Control ---
@@ -329,7 +338,7 @@ func getOpInfo(op byte) opInfo {
 	}
 }
 
-// Phase 1 전용 Opcode 정보 반환 (모든 명령어 지원)
+// getPhase1OpInfo supports all opcodes to support static analysis for stack and memory propgatation
 func getPhase1OpInfo(op byte) opInfo {
 	switch {
 	// --- 0x00: Stop & Arithmetic ---
@@ -415,14 +424,10 @@ func getPhase1OpInfo(op byte) opInfo {
 
 	// --- 0x80: DUP ---
 	case op >= 0x80 && op <= 0x8f: // DUP1 ~ DUP16
-		// DUP은 Pop하지 않고(0), 하나 더 얹음(1).
-		// *주의*: Underflow 체크(깊이 n개 확인)는 Loop 안에서 별도로 수행해야 함.
 		return opInfo{0, 1, true, false}
 
 	// --- 0x90: SWAP ---
 	case op >= 0x90 && op <= 0x9f: // SWAP1 ~ SWAP16
-		// SWAP은 교체만 하므로 스택 높이 변화 없음.
-		// *주의*: Underflow 체크(깊이 n+1개 확인)는 Loop 안에서 별도로 수행해야 함.
 		return opInfo{0, 0, true, false}
 
 	// --- 0xA0: LOG ---
@@ -454,16 +459,15 @@ func getPhase1OpInfo(op byte) opInfo {
 	}
 }
 
-// BatchAnalysisResult: 분석된 JIT 블록들의 집합
-// Key: 블록의 시작 PC (uint64)
-// Value: JIT 실행에 필요한 메타데이터 (가스, 스택 정보 등)
+// BatchAnalysisResult: set of compilable code
+// key: start PC
+// value: metadata of compilable code
 type BatchAnalysisResult map[uint64]JitTraceResult
 
-// JIT 실행을 위한 최소 바이트코드 길이 임계값
-// 너무 짧은 코드(예: PUSH 1개)는 JIT 오버헤드가 더 크므로 무시
+// Minimum bytecode length threshold for JIT execution
+// const MinJitBlockSize = 20
 // const MinJitBlockSize = 10
-
-// const MinJitBlockSize = 8
+// // const MinJitBlockSize = 8
 const MinJitBlockSize = 5
 
 func (az *traceAnalyzer) run() (BatchAnalysisResult, error) {
@@ -471,28 +475,37 @@ func (az *traceAnalyzer) run() (BatchAnalysisResult, error) {
 		return nil, err
 	}
 
-	// Worklist가 빌 때까지 반복 (BFS/DFS)
+	cnt := 0
+	for _, s := range az.memSlot {
+		if s.isStatic {
+			cnt++
+		}
+	}
+	fmt.Println("M", cnt)
+
+	// Worklist: BFS
 	for len(az.worklist) > 0 {
 		// 1. Pop
 		pc := az.worklist[0]
 		az.worklist = az.worklist[1:]
 
-		// 2. 유효성 및 중복 방문 체크
-		if pc >= uint64(len(az.code)) {
-			continue
-		}
+		// TODO: Remove me
+		// // 2. 유효성 및 중복 방문 체크
+		// if pc >= uint64(len(az.code)) {
+		// 	fmt.Println("??")
+		// 	continue
+		// }
 		if az.visited[pc] {
 			continue
 		}
 
-		// 3. 새로운 Trace 분석 시작
 		az.analyzeSuperBlock(pc)
 	}
 
 	return az.results, nil
 }
 
-// analyzeSuperBlock: JUMPDEST를 무시하고 JUMPI/JUMP까지 길게 분석 (Superblock Strategy)
+// analyzeSuperBlock collects compilable code
 func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 	// 상태 초기화
 	az.resetInternalState(startPC)
@@ -501,15 +514,13 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 	localPath := make(map[uint64]bool)
 	localPath[startPC] = true
 
-	// 루프: Control Flow가 바뀔 때까지 무한 직진
 	for az.pc < uint64(len(az.code)) {
 		op := az.code[az.pc]
 
 		// ---------------------------------------------------------
 		// [1] JUMPDEST (0x5b) 처리
 		// ---------------------------------------------------------
-		// Superblock 전략: JUMPDEST에서 블록을 끊지 않고 계속 잇습니다.
-		// 외부에서 들어오는 분기점일 수 있지만, 현재 Trace 관점에서는 단순 통과점입니다.
+		// Superblock strategy: Continue tracing without breaking the block at JUMPDEST.
 		if op == 0x5b {
 			az.finishSegment() // Offset 조정을 위해 끊어줌
 			az.pc++            // JUMPDEST(1byte) 건너뛰기
@@ -521,24 +532,47 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 		info := getOpInfo(op)
 
-		if op == 0x51 || op == 0x52 || op == 0x53 {
+		if op == 0x51 || op == 0x52 || op == 0x53 || op == 0x20 {
 			memSlot := az.memSlot[az.pc]
-			if memSlot.isStatic && memSlot.off > az.maxMemoryOff {
-				az.maxMemoryOff = memSlot.off
+
+			if memSlot.isStatic {
+				var dataLen uint64
+				switch op {
+				case 0x51, 0x52: // MLOAD, MSTORE
+					dataLen = 32
+				case 0x53: // MSTORE8
+					dataLen = 1
+				}
+
+				reqEnd, overflow := math.SafeAdd(memSlot.off, dataLen)
+				if overflow {
+					info.isSupported = false
+				} else {
+					wordCount := toWordSize(reqEnd)
+					memorySize, overflow := math.SafeMul(wordCount, 32)
+					if overflow {
+						info.isSupported = false
+					} else {
+						if memorySize > az.maxMemoryOff {
+							// TODO: Runtime JIT에서 0x20 (SHA3) 핸들링할때 `memory.GetPtr()`가 하는것처럼 range 체크필요
+							az.maxMemoryOff = memorySize
+						}
+					}
+				}
 			} else {
+				// if the memory offset is not able to calculate statically, we don't jit
 				info.isSupported = false
 			}
 		}
+		// 여기로 자연스럽게 내려와서 이후의 segment 저장 로직이 실행됨
 
 		// ---------------------------------------------------------
-		// [2] 미지원 Opcode (Unsupported)
+		// [2] Unsupported Opcode
 		// ---------------------------------------------------------
-		// JIT는 여기서 멈추지만, 인터프리터 실행 후 다음 명령어부터
-		// 다시 JIT가 가능할 수 있으므로 Next PC를 Worklist에 추가합니다.
+		// JIT stops here, but execution may resume from the next instruction via the interpreter.
+		// Add the Next PC to the worklist to allow for future JIT compilation.
 		if !info.isSupported {
-			az.saveSegment(az.pc) // NextPC = 현재 위치 (Interpreter 진입점)
-			// az.addToWorklist(az.pc + 1)
-
+			az.saveSegment(az.pc)
 			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 				az.addToWorklist(az.pc + 2)
 			} else {
@@ -551,26 +585,21 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		// [3] JUMP (Unconditional)
 		// ---------------------------------------------------------
 		if op == 0x56 {
-			// Static Jump (Fusion) 확인
+			// Check static Jump (Opcode fusion)
 			dest, isStatic := az.checkStaticJump()
 
 			if isStatic {
-				// [Static Jump] -> Inlining 시도
-
-				// 1. 내 꼬리를 물었나? (Infinite Loop 방지)
+				// Is it for loop?: then we exit the current analysis loop to avoid infinite analysis
 				if localPath[dest] {
 					panic("TODO: Remove me")
-					// 루프 발견! 여기서 끊고 Dispatcher에게 넘김
 					az.saveSegment(dest)
-					// (dest는 이미 path에 있으니 startPC로 등록되어 있거나 worklist에 있을 것임)
 					return
 				}
 
-				// 가스비 처리 & 명령어 제거
+				// Gas consumption and remove opcode (Opcode Fusion)
 				az.totalGas += jitGasTable[0x56]
 				az.currentRelDepth -= 1
 
-				// az.segLen -= az.lastInstSize
 				if az.lastOp >= 0x60 && az.lastOp <= 0x7f {
 					az.segLen -= az.lastInstSize
 				} else {
@@ -578,9 +607,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				}
 				az.finishSegment()
 
-				// 방문 여부에 따라 Inlining 결정
 				if az.visited[dest] {
-					// 이미 방문함 (Loop Back-edge 등) -> 끊고 Link
 					az.saveSegment(dest)
 				} else {
 					if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
@@ -588,21 +615,20 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 					} else {
 						az.addToWorklist(az.pc + 1)
 					}
-					// 처음 방문함 -> Inlining (이어 붙이기)
+					// Inlining (code segement stitching)
 					az.pc = dest
 					az.segOffset = dest
 					az.segLen = 0
 					az.resetLastOp()
 					localPath[dest] = true
 
-					continue // Worklist 추가 없이 직접 이동
+					continue // No add worklist; continue on the current segement analysis
 				}
 			} else {
-				// [Dynamic Jump] -> 분석 불가, 여기서 종료
+				// Dynamic jump: Not able to stich. Exit the current analysis here
 				az.saveSegment(az.pc)
 
-				// [수정] Dynamic Jump라도 혹시 모를 Fall-through나
-				// 다른 경로에서의 진입을 위해 다음 PC를 Worklist에 추가
+				// Fall-through: add the next PC to the worklist to allow entry from other paths.
 				if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 					az.addToWorklist(az.pc + 2)
 				} else {
@@ -616,19 +642,17 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		// [4] JUMPI (Conditional)
 		// ---------------------------------------------------------
 		if op == 0x57 {
-			// JUMPI는 실행 흐름 분기점이므로 Trace 종료
+			// JUMPI is a control flow branch; terminating the trace.
 			az.saveSegment(az.pc)
 
-			// [수정] Dynamic Target일 수도 있으므로, Fall-through는 무조건 추가
-
-			// 경로 1: Fall-through (조건 거짓)
+			// Fall-through: false path
 			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
 				az.addToWorklist(az.pc + 2)
 			} else {
 				az.addToWorklist(az.pc + 1)
 			}
 
-			// 경로 2: Target (조건 참) - Static일 경우만 추가 가능
+			// Fall-through: true path (if and only if statically calculated)
 			if dest, isStatic := az.checkStaticJump(); isStatic && az.isValidJumpDest(dest) {
 				az.addToWorklist(dest + 1)
 			}
@@ -636,14 +660,15 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 			return
 		}
 
-		// [5] 일반 명령어 (Normal Execution)
+		// [5] Normal opcode (supported opcode)
 		if !az.finalizeStep(op, info) {
+			// TODO: if `false` is returned, no compile artifact should be created for the current superblock
 			az.discardSegment()
 			return
 		}
 	}
 
-	// 코드 끝(EOF)에 도달
+	// EOF
 	az.saveSegment(az.pc)
 }
 
@@ -652,24 +677,24 @@ type Worklist struct {
 	srcs    string
 }
 
-func copyMemSlot(memSlotFrom, memSlotTo map[uint64]MemAnalysisSlot) {
+func copyMemSlot(memSlotFrom, memSlotTo map[uint64]memAnalysisSlot) {
 	for off, slot := range memSlotFrom {
-		newSlot := MemAnalysisSlot{isStatic: slot.isStatic, off: slot.off}
+		newSlot := memAnalysisSlot{isStatic: slot.isStatic, off: slot.off}
 		if slot.val != nil {
-			newSlot.val = new(big.Int).Set(slot.val)
+			newSlot.val = slot.val.Clone()
 		}
 		memSlotTo[off] = newSlot
 	}
 }
 
 func (az *traceAnalyzer) runPhase1(startPC uint64) error {
-	// 초기 상태: 시작점 스택은 비어있음
+	// Initial state: empty stack and empty memory
 	az.blockStacks[fmt.Sprintf("%x", startPC)] = []analysisSlot{}
-	az.blockMems[fmt.Sprintf("%x", startPC)] = make(map[uint64]MemAnalysisSlot)
+	az.blockMems[fmt.Sprintf("%x", startPC)] = make(map[uint64]memAnalysisSlot)
 	var (
 		worklist = []Worklist{{startPC: startPC, srcs: fmt.Sprintf("%x", startPC)}}
 		jumpSrcs = make(map[uint64]map[uint64]bool)
-		// Helper: 스택 전파 (Deep Copy)
+		// Helper: Stack propagation (Deep Copy)
 		propagateStack = func(srcPC, targetPC uint64, originSrcs string, stack []analysisSlot) {
 			newStack := make([]analysisSlot, len(stack))
 			if strings.Contains(originSrcs, fmt.Sprintf("%x", targetPC)) {
@@ -681,8 +706,9 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 			worklist = append(worklist, Worklist{startPC: targetPC, srcs: srcs})
 		}
 
-		propagateMem = func(srcPC, targetPC uint64, originSrcs string, memSlot map[uint64]MemAnalysisSlot) {
-			newMemSlot := make(map[uint64]MemAnalysisSlot)
+		// Helper: Memory propagation (Deep Copy)
+		propagateMem = func(srcPC, targetPC uint64, originSrcs string, memSlot map[uint64]memAnalysisSlot) {
+			newMemSlot := make(map[uint64]memAnalysisSlot)
 			if strings.Contains(originSrcs, fmt.Sprintf("%x", targetPC)) {
 				return
 			}
@@ -704,20 +730,17 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 		copy(stack, az.blockStacks[srcs])
 
 		// memory copy
-		memSlot := make(map[uint64]MemAnalysisSlot)
+		memSlot := make(map[uint64]memAnalysisSlot)
 		copyMemSlot(az.blockMems[srcs], memSlot)
 
-		// 블록 순회
 		for pc < uint64(len(az.code)) {
 			op := az.code[pc]
 			info := getPhase1OpInfo(op)
 
-			// 미지원 Opcode -> 여기서 끊김
 			if !info.isSupported {
 				panic("TODO: Remove me")
 				break
 			}
-			// 명령어 길이
 			instSize := uint64(1)
 			if op >= 0x60 && op <= 0x7f {
 				instSize += uint64(op - 0x60 + 1)
@@ -729,43 +752,117 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				break
 			}
 
-			arithFunc := func(fn func(*big.Int, *big.Int) (*big.Int, bool)) {
-				s1, s2 := stack[len(stack)-1], stack[len(stack)-2] // Top, Second
-				stack = stack[:len(stack)-2]
-				if s1.isStatic && s2.isStatic {
-					if res, ok := fn(s1.val, s2.val); ok {
-						stack = append(stack, analysisSlot{true, res})
-						return
-					}
+			unaryFunc := func(fn func(*uint256.Int) *uint256.Int) {
+				s1 := stack[len(stack)-1] // Top
+				stack = stack[:len(stack)-1]
+				if s1.isStatic {
+					res := fn(s1.val)
+					stack = append(stack, analysisSlot{true, res})
+					return
 				}
 				stack = append(stack, analysisSlot{isStatic: false})
 			}
+
+			binaryFunc := func(fn func(*uint256.Int, *uint256.Int) *uint256.Int) {
+				s1, s2 := stack[len(stack)-1], stack[len(stack)-2] // Top, Second
+				stack = stack[:len(stack)-2]
+				if s1.isStatic && s2.isStatic {
+					res := fn(s1.val, s2.val)
+					stack = append(stack, analysisSlot{true, res})
+					return
+				}
+				stack = append(stack, analysisSlot{isStatic: false})
+			}
+
+			ternaryFunc := func(fn func(*uint256.Int, *uint256.Int, *uint256.Int) *uint256.Int) {
+				s1 := stack[len(stack)-1]    // Top (N)
+				s2 := stack[len(stack)-2]    // b
+				s3 := stack[len(stack)-3]    // a
+				stack = stack[:len(stack)-3] // Pop 3
+
+				if s1.isStatic && s2.isStatic && s3.isStatic {
+					res := fn(s1.val, s2.val, s3.val) // fn(a, b, N)
+					stack = append(stack, analysisSlot{true, res})
+					return
+				}
+				stack = append(stack, analysisSlot{isStatic: false})
+			}
+			// TODO: Support more opcodes to wide the possible range of statically calculatable memory values
 			switch {
-			case op == 0x01:
-				arithFunc(safeAdd)
-			case op == 0x02:
-				arithFunc(safeMul)
-			case op == 0x03:
-				arithFunc(safeSub)
-			case op == 0x16:
-				arithFunc(safeAnd)
-			case op == 0x1b:
-				arithFunc(safeShl)
+			// --- Arithmetic (Binary) ---
+			case op == 0x01: // ADD
+				binaryFunc(Add)
+			case op == 0x02: // MUL
+				binaryFunc(Mul)
+			case op == 0x03: // SUB
+				binaryFunc(Sub)
+			case op == 0x04: // DIV
+				binaryFunc(Div)
+			case op == 0x05: // SDIV [New]
+				binaryFunc(SDiv)
+			case op == 0x06: // MOD
+				binaryFunc(Mod)
+			case op == 0x07: // SMOD [New]
+				binaryFunc(SMod)
+			case op == 0x08: // ADDMOD [New - Ternary]
+				ternaryFunc(AddMod)
+			case op == 0x09: // MULMOD [New - Ternary]
+				ternaryFunc(MulMod)
+			case op == 0x0B: // SIGNEXTEND [New]
+				// SIGNEXTEND(b, x): Stack Top(b), Second(x)
+				// binaryFunc는 Top(s1), Second(s2)를 꺼내서 fn(s1, s2)를 호출함.
+				// EVM 스펙상 순서는 Stack[0]=b, Stack[1]=x.
+				// 아래 구현된 SignExtend 함수 파라미터 순서에 유의.
+				binaryFunc(SignExtend)
+
+			// --- Comparison (Binary) ---
+			case op == 0x10: // LT
+				binaryFunc(Lt)
+			case op == 0x11: // GT
+				binaryFunc(Gt)
+			case op == 0x12: // SLT [New]
+				binaryFunc(Slt)
+			case op == 0x13: // SGT [New]
+				binaryFunc(Sgt)
+			case op == 0x14: // EQ
+				binaryFunc(Eq)
+			case op == 0x15: // ISZERO (Unary)
+				unaryFunc(IsZero)
+
+			// --- Bitwise (Binary/Unary) ---
+			case op == 0x16: // AND
+				binaryFunc(And)
+			case op == 0x17: // OR
+				binaryFunc(Or)
+			case op == 0x18: // XOR
+				binaryFunc(Xor)
+			case op == 0x19: // NOT (Unary)
+				unaryFunc(Not)
+			case op == 0x1A: // BYTE [Updated: Unary]
+				// 님 요청대로 Unary Operation으로 처리
+				// Stack: [..., value] -> [..., byte(value)]
+				unaryFunc(Byte)
+			case op == 0x1B: // SHL
+				binaryFunc(Shl)
+			case op == 0x1C: // SHR
+				binaryFunc(Shr)
+			case op == 0x1D: // SAR
+				binaryFunc(Sar)
 
 			// MLOAD
 			case op == 0x51:
 				off := stack[len(stack)-1]
 				stack[len(stack)-1] = analysisSlot{isStatic: false} // pre-assigment. will be updated if possible
 				if off.isStatic {
-					if _, ok := safeAdd(off.val, big.NewInt(32)); ok {
+					if _, overflow := math.SafeAdd(off.val.Uint64(), 32); !overflow {
 						// TODO: add memory size overflow check
-						var val *big.Int
+						var val *uint256.Int
 						isStatic := false
 						if memSlot[off.val.Uint64()].isStatic {
 							val = memSlot[off.val.Uint64()].val
 							isStatic = true
 						}
-						memSlot[off.val.Uint64()] = MemAnalysisSlot{isStatic: isStatic, off: off.val.Uint64(), val: val}
+						memSlot[off.val.Uint64()] = memAnalysisSlot{isStatic: isStatic, off: off.val.Uint64(), val: val}
 						az.memSlot[pc] = memSlot[off.val.Uint64()]
 						stack[len(stack)-1] = analysisSlot{isStatic: isStatic, val: val}
 					}
@@ -777,17 +874,125 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				val := stack[len(stack)-2]
 				stack = stack[:len(stack)-2]
 				if off.isStatic && val.isStatic {
-					valStore := val.val
-					if op == 0x53 { // MSTORE8
-						valStore = new(big.Int).And(valStore, big.NewInt(0xFF))
+					var (
+						valStore = val.val.Clone()
+						dataLen  uint64
+					)
+					if op == 0x52 { // MSTORE
+						dataLen = 32
+					} else { // MSTORE8
+						dataLen = 1
+						valStore.And(valStore, uint256.NewInt(0xFF)) // 하위 1바이트만 유지
 					}
-					memSlot[off.val.Uint64()] = MemAnalysisSlot{isStatic: true, off: off.val.Uint64(), val: valStore}
+					memSlot[off.val.Uint64()] = memAnalysisSlot{
+						isStatic: true,
+						off:      off.val.Uint64(),
+						length:   dataLen,
+						val:      valStore,
+					}
 					az.memSlot[pc] = memSlot[off.val.Uint64()]
 				}
 
+			// [수정] SHA3 (0x20) - 가스비 계산용 Offset/Length 추적에만 집중
+			// 메모리 내용(Value) 복원은 포기하고 결과는 항상 Dynamic으로 처리
+			case op == 0x20:
+				size := stack[len(stack)-2]
+				offset := stack[len(stack)-1]
+				stack = stack[:len(stack)-2] // Pop 2
+
+				// 1. 결과값은 항상 동적(Dynamic)으로 처리 (값 계산 포기)
+				// 이렇게 하면 뒤따르는 로직들은 SHA3 결과를 모르는 상태로 진행됨
+				stack = append(stack, analysisSlot{isStatic: false})
+
+				// 2. 입력값(Offset, Size)이 정적이라면 가스비 계산을 위해 기록
+				if offset.isStatic && size.isStatic {
+					start := offset.val.Uint64()
+					length := size.val.Uint64()
+
+					// 오버플로우 체크 (유효한 메모리 범위인지 확인)
+					if _, overflow := math.SafeAdd(start, length); !overflow {
+						// 3. 메모리 사용 정보 기록
+						// 값(val)이나 구체적인 데이터는 몰라도 됨.
+						// 이 정보는 나중에 analyzeSuperBlock에서:
+						// 1) Memory Expansion Gas 계산
+						// 2) SHA3 Word Gas (6 * words) 계산
+						// 에 사용됩니다.
+						az.memSlot[pc] = memAnalysisSlot{
+							isStatic: true,
+							off:      start,
+							length:   length,
+							val:      nil, // 내용은 추적하지 않음
+						}
+					}
+				}
+
+			// // SHA3
+			// case op == 0x20:
+			// 	size := stack[len(stack)-2]
+			// 	offset := stack[len(stack)-1]
+			// 	stack = stack[:len(stack)-2] // Pop 2
+
+			// 	var (
+			// 		hashResult *uint256.Int
+			// 		isStatic   = false
+			// 	)
+			// 	if offset.isStatic && size.isStatic {
+			// 		start := offset.val.Uint64()
+			// 		length := size.val.Uint64()
+			// 		if _, overflow := math.SafeAdd(start, length); !overflow {
+			// 			var (
+			// 				data    = make([]byte, length)
+			// 				valid   = true
+			// 				current = uint64(0)
+			// 			)
+
+			// 			for current < length {
+			// 				slot, exists := memSlot[start+current]
+			// 				if !exists || !slot.isStatic || slot.val == nil || slot.length == 0 {
+			// 					fmt.Println("@@@", start+current, length, exists, slot.isStatic, slot.val, slot.length)
+			// 					for p := range memSlot {
+			// 						fmt.Println("!!!", p)
+			// 					}
+			// 					valid = false
+			// 					break
+			// 				}
+			// 				chunkSize := slot.length // 32(MSTORE) or 1(MSTORE8)
+			// 				valBytes := slot.val.Bytes32()
+			// 				// 데이터 추출 시작 지점 계산
+			// 				// MSTORE (len=32): 0번 인덱스부터 사용
+			// 				// MSTORE8 (len=1): 31번 인덱스(LSB)만 사용
+			// 				srcStart := 32 - chunkSize
+
+			// 				// 복사할 길이 계산 (남은 길이가 청크보다 작을 수 있음)
+			// 				bytesToCopy := chunkSize
+			// 				if current+bytesToCopy > length {
+			// 					bytesToCopy = length - current
+			// 				}
+			// 				copy(data[current:], valBytes[srcStart:srcStart+bytesToCopy])
+			// 				current += bytesToCopy
+			// 			}
+			// 			if valid {
+			// 				hasher := sha3.NewLegacyKeccak256()
+			// 				hasher.Write(data)
+			// 				hashResult = new(uint256.Int).SetBytes(hasher.Sum(nil))
+			// 				isStatic = true
+			// 			}
+			// 		}
+			// 		// 5. 메모리 사용 정보 기록 (Gas 계산용)
+			// 		// 해시 계산 성공 여부와 관계없이, 정적인 Offset/Size 접근은 기록해야 함
+			// 		az.memSlot[pc] = memAnalysisSlot{
+			// 			isStatic: isStatic,
+			// 			off:      start,
+			// 			length:   length,
+			// 			val:      nil,
+			// 		}
+			// 	}
+			// 	// 6. 결과 스택에 Push
+			// 	stack = append(stack, analysisSlot{isStatic: isStatic, val: hashResult})
+
 			case op == 0x56: // JUMP
-				target := stack[len(stack)-1]     // Top 확인
-				nextStack := stack[:len(stack)-1] // Pop Address
+				target := stack[len(stack)-1]
+				nextStack := stack[:len(stack)-1]
 				if _, exist := jumpSrcs[pc]; !exist {
 					jumpSrcs[pc] = make(map[uint64]bool)
 				}
@@ -795,10 +1000,9 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 
 				if target.isStatic {
 					dest := target.val.Uint64()
-					// 유효성 체크
 					if az.isValidJumpDest(dest) {
 						if !isLastOpPush {
-							az.jumpTargets[pc] = dest // [기록] Phase 2에서 사용
+							az.jumpTargets[pc] = dest // Will be used for Phase 2 (Superblock analysis)
 						}
 						propagateStack(pc, dest, srcs, nextStack)
 						propagateMem(pc, dest, srcs, memSlot)
@@ -808,10 +1012,10 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				// propagateStack(pc, pc+1, srcs, nextStack)
 				// propagateMem(pc, pc+1, srcs, memSlot)
 				isLastOpPush = false
-				goto StopBlock // 블록 종료
+				goto StopBlock
 
 			case op == 0x57: // JUMPI
-				target := stack[len(stack)-1]     // 2nd Item
+				target := stack[len(stack)-1]
 				nextStack := stack[:len(stack)-2] // Pop 2
 
 				// 1. Jump Path
@@ -853,23 +1057,8 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 
 			case op >= 0x60 && op <= 0x7f: // PUSH
 				data := az.code[pc+1 : pc+instSize]
-				// slot := analysisSlot{isStatic: false}
-
-				// TODO: Remove me
-				// // 8바이트 이하 & 코드 범위 내 -> Static
-				// if len(data) <= 8 {
-				// 	var buf [8]byte
-				// 	copy(buf[8-len(data):], data)
-				// 	val := binary.BigEndian.Uint64(buf[:])
-
-				// 	if val < uint64(len(az.code)) {
-				// 		slot = analysisSlot{isStatic: true, val: val}
-				// 	} else {
-				// 		fmt.Printf("KKKK: %x\n", pc)
-				// 	}
-				// }
-
-				slot := analysisSlot{isStatic: true, val: new(big.Int).SetBytes(data)}
+				// slot := analysisSlot{isStatic: true, val: new(big.Int).SetBytes(data)}
+				slot := analysisSlot{isStatic: true, val: new(uint256.Int).SetBytes(data)}
 				stack = append(stack, slot)
 				isLastOpPush = true
 
@@ -887,9 +1076,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 					stack = append(stack, analysisSlot{isStatic: false})
 				}
 				isLastOpPush = false
-
 			}
-
 			pc += instSize
 		}
 	StopBlock:
@@ -910,20 +1097,15 @@ func (az *traceAnalyzer) addToWorklist(pc uint64) {
 	for pc < uint64(len(az.code)) {
 		op := az.code[pc]
 
-		// PUSH1(0x60) ~ PUSH32(0x7f) 인지 확인
 		if op >= 0x60 && op <= 0x7f {
 			dataLen := uint64(op - 0x60 + 1)
-			// 다음 명령어 위치 = 현재위치 + 1(Opcode) + 데이터길이
 			nextPC := pc + 1 + dataLen
-
-			// 만약 건너뛴 위치가 코드 끝을 넘어가면 중단
 			if nextPC >= uint64(len(az.code)) {
 				pc = nextPC
 				break
 			}
 			pc = nextPC
 		} else {
-			// PUSH가 아니면 루프 종료 (스킵 완료)
 			break
 		}
 	}
@@ -937,107 +1119,73 @@ func (az *traceAnalyzer) checkStaticJump() (uint64, bool) {
 	if dest, exist := az.jumpTargets[az.pc]; exist {
 		return dest, true
 	}
-
 	// case2: dynamic jump
 	if !az.isLastOpPush() {
 		return 0, false
 	}
-
 	dest, ok := az.getDestIfValid(az.lastPushData)
 	if !ok {
 		return 0, false
 	}
-
-	// 목적지가 유효하고 JUMPDEST인지 확인
 	if dest >= uint64(len(az.code)) || az.code[dest] != 0x5b {
 		return 0, false
 	}
-
 	return dest, true
 }
 
 // saveSegment: 현재까지 모은 세그먼트들이 유효하고 길다면 결과 맵에 저장
 func (az *traceAnalyzer) saveSegment(nextPC uint64) {
-	// [핵심 추가] 1. 현재 모으고 있던 조각(Pending)이 있다면 슬라이스에 추가 (Flush)
-	// fmt.Println("S-1")
+	// Flush the current segment
 	az.finishSegment()
-	// fmt.Println("S-2")
 
-	// 1. 세그먼트가 없으면 저장할 필요 없음
+	// 1. if no segement, return early
 	if len(az.segments) == 0 {
 		return
 	}
 
-	// 2. [임계값 체크] JIT 할 가치가 있는 길이인지 확인
+	// 2. Threshold Check: Ensure the bytecode is long enough to justify JIT.
 	totalLen := uint64(0)
 	for _, s := range az.segments {
 		totalLen += s.Length
 	}
 
 	if totalLen < MinJitBlockSize {
-		// if totalLen != 10 {
-		// if totalLen != MinJitBlockSize {
-		// 너무 짧으면 그냥 버림 (인터프리터가 실행하는 게 나음)
 		az.discardSegment()
 		return
 	}
 
-	// 3. 결과 구조체 생성
+	// 3. Finalize the JIT trace result
 	res := JitTraceResult{
-		CanJit: true,
-		// 슬라이스 복사 (Deep Copy) - az.segments는 재사용되므로 복사 필수
+		// Deep copy the slice - Mandatory since az.segments is reused.
 		Segments: slices.Clone(az.segments),
 
 		TotalGas:      az.totalGas,
-		NetStackDelta: az.currentRelDepth, // 최종 상대 높이가 곧 순수 변화량
+		NetStackDelta: az.currentRelDepth,
 
-		// [핵심] 최저점이 -5였다면, 실행 전 최소 5개가 필요함
-		// minStackDepth는 항상 0 이하의 음수이므로 부호를 반대로 뒤집음
+		// Since minStackDepth is always 0 or negative, negate it
 		MinStack: -az.minStackDepth,
 
 		MaxStackGrowth: az.maxGrowth,
-		MaxMemoryOff:   az.maxMemoryOff + 32,
+		MaxMemoryOff:   az.maxMemoryOff,
 		NextPC:         nextPC,
 	}
 
-	// 4. 결과 맵에 등록 (Key: 이 블록의 최초 시작점)
 	az.results[az.startPC] = res
-
-	// 5. 저장했으므로 내부 버퍼 비우기 (다음 블록 준비)
+	// 4. Clear the segment and prepare for next block analysis
 	az.segments = az.segments[:0]
 }
 
-// discardSegment: 현재 모으던 블록을 폐기 (오염되었거나, 스티칭 실패 시)
 func (az *traceAnalyzer) discardSegment() {
 	az.segments = az.segments[:0]
 }
 
-// // prepareNextBlock: 새로운 JIT 블록 탐색을 위한 시작점 설정
-// // (미지원 명령어 등을 건너뛴 직후 호출됨)
-// func (az *traceAnalyzer) prepareNextBlock(newStartPC uint64) {
-// 	// 내부 상태(스택 시뮬레이션 등) 리셋
-// 	az.resetInternalState()
-
-// 	// if new start PC is JUMPDEST, then skip it
-// 	if az.code[newStartPC] == 0x5b {
-// 		newStartPC++
-// 	}
-
-// 	// 시작점 정보 갱신
-// 	az.startPC = newStartPC
-// 	az.segOffset = newStartPC
-// }
-
-// resetInternalState: 누적된 시뮬레이션 상태 변수 초기화
 func (az *traceAnalyzer) resetInternalState(startPC uint64) {
-	// 세그먼트 리스트 비움
-	az.segments = az.segments[:0] // GC 효율을 위해 capacity는 유지하고 len만 0으로 (az.segments[:0]) 해도 됨
+	az.segments = az.segments[:0]
 
 	az.pc = startPC
 	az.startPC = startPC
 	az.segOffset = startPC
 
-	// 스택 시뮬레이터 초기화 (새 블록은 0부터 시작)
 	az.currentRelDepth = 0
 	az.minStackDepth = 0
 	az.maxGrowth = 0
@@ -1046,31 +1194,177 @@ func (az *traceAnalyzer) resetInternalState(startPC uint64) {
 
 	az.resetLastOp()
 
-	// 현재 세그먼트 길이 초기화
 	az.segLen = 0
 }
 
-// TODO: Add overflow check
-func safeAdd(top, sec *big.Int) (*big.Int, bool) {
-	return new(big.Int).Add(top, sec), true
+// ============================================================================
+// Arithmetic Operations (Return *uint256.Int only)
+// ============================================================================
+
+func Add(top, sec *uint256.Int) *uint256.Int {
+	return new(uint256.Int).Add(top, sec)
 }
 
-// TODO: Add overflow check
-func safeMul(top, sec *big.Int) (*big.Int, bool) {
-	return new(big.Int).Mul(top, sec), true
+func Mul(top, sec *uint256.Int) *uint256.Int {
+	return new(uint256.Int).Mul(top, sec)
 }
 
-// TODO: Add overflow check
-func safeSub(top, sec *big.Int) (*big.Int, bool) {
-	return new(big.Int).Sub(top, sec), true
+func Sub(top, sec *uint256.Int) *uint256.Int {
+	// EVM: Stack[0] - Stack[1]
+	return new(uint256.Int).Sub(top, sec)
 }
 
-// TODO: Add overflow check
-func safeAnd(top, sec *big.Int) (*big.Int, bool) {
-	return new(big.Int).And(top, sec), true
+func Div(top, sec *uint256.Int) *uint256.Int {
+	// EVM: Stack[0] / Stack[1]
+	if sec.IsZero() {
+		return new(uint256.Int) // 0
+	}
+	return new(uint256.Int).Div(top, sec)
 }
 
-// TODO: Add overflow check
-func safeShl(top, sec *big.Int) (*big.Int, bool) {
-	return new(big.Int).Lsh(sec, uint(top.Uint64())), true
+func Mod(top, sec *uint256.Int) *uint256.Int {
+	if sec.IsZero() {
+		return new(uint256.Int)
+	}
+	return new(uint256.Int).Mod(top, sec)
+}
+
+func SDiv(top, sec *uint256.Int) *uint256.Int {
+	// EVM: Stack[0](top) / Stack[1](sec) (Signed)
+	if sec.IsZero() {
+		return new(uint256.Int) // 0
+	}
+	return new(uint256.Int).SDiv(top, sec)
+}
+
+func SMod(top, sec *uint256.Int) *uint256.Int {
+	if sec.IsZero() {
+		return new(uint256.Int)
+	}
+	return new(uint256.Int).SMod(top, sec)
+}
+
+func SignExtend(b, x *uint256.Int) *uint256.Int {
+	// EVM: SIGNEXTEND(b, x) -> extends length of x to (b+1) bytes
+	// binaryFunc에서 호출 시: top=b, sec=x
+	return new(uint256.Int).ExtendSign(x, b)
+}
+
+func AddMod(a, b, mod *uint256.Int) *uint256.Int {
+	if mod.IsZero() {
+		return new(uint256.Int)
+	}
+	return new(uint256.Int).AddMod(a, b, mod)
+}
+
+func MulMod(a, b, mod *uint256.Int) *uint256.Int {
+	if mod.IsZero() {
+		return new(uint256.Int)
+	}
+	return new(uint256.Int).MulMod(a, b, mod)
+}
+
+// ============================================================================
+// Bitwise Operations
+// ============================================================================
+
+func Byte(val *uint256.Int) *uint256.Int {
+	ret := new(uint256.Int).Set(val)
+	return ret.And(ret, uint256.NewInt(0xFF))
+}
+
+func And(top, sec *uint256.Int) *uint256.Int {
+	return new(uint256.Int).And(top, sec)
+}
+
+func Or(top, sec *uint256.Int) *uint256.Int {
+	return new(uint256.Int).Or(top, sec)
+}
+
+func Xor(top, sec *uint256.Int) *uint256.Int {
+	return new(uint256.Int).Xor(top, sec)
+}
+
+func Not(top *uint256.Int) *uint256.Int {
+	return new(uint256.Int).Not(top)
+}
+
+// ============================================================================
+// Shift Operations (Stack[0]=ShiftAmount, Stack[1]=Value)
+// ============================================================================
+
+func Shl(top, sec *uint256.Int) *uint256.Int {
+	if top.LtUint64(256) {
+		return new(uint256.Int).Lsh(sec, uint(top.Uint64()))
+	}
+	return new(uint256.Int)
+}
+
+func Shr(top, sec *uint256.Int) *uint256.Int {
+	if top.LtUint64(256) {
+		return new(uint256.Int).Rsh(sec, uint(top.Uint64()))
+	}
+	return new(uint256.Int)
+}
+
+func Sar(top, sec *uint256.Int) *uint256.Int {
+	if top.LtUint64(256) {
+		return new(uint256.Int).SRsh(sec, uint(top.Uint64()))
+	}
+	// Shift >= 256: Signed check
+	if sec.Sign() < 0 {
+		return new(uint256.Int).SetAllOne() // -1
+	}
+	return new(uint256.Int) // 0
+}
+
+// ============================================================================
+// Comparison Operations
+// ============================================================================
+
+var (
+	u256Zero = new(uint256.Int)
+	u256One  = uint256.NewInt(1)
+)
+
+func Lt(top, sec *uint256.Int) *uint256.Int {
+	if top.Lt(sec) {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
+}
+
+func Gt(top, sec *uint256.Int) *uint256.Int {
+	if top.Gt(sec) {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
+}
+
+func Eq(top, sec *uint256.Int) *uint256.Int {
+	if top.Eq(sec) {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
+}
+
+func Slt(top, sec *uint256.Int) *uint256.Int {
+	if top.Slt(sec) {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
+}
+
+func Sgt(top, sec *uint256.Int) *uint256.Int {
+	if top.Sgt(sec) {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
+}
+
+func IsZero(top *uint256.Int) *uint256.Int {
+	if top.IsZero() {
+		return u256One.Clone()
+	}
+	return u256Zero.Clone()
 }
