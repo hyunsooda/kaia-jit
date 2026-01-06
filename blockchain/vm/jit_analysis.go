@@ -110,7 +110,7 @@ func (az *traceAnalyzer) isValidJumpDest(dest uint64) bool {
 	if dest >= uint64(len(az.code)) {
 		return false
 	}
-	if az.code[dest] != 0x5b {
+	if az.code[dest] != byte(JUMPDEST) {
 		return false
 	}
 	return az.jumpDests.codeSegment(dest)
@@ -121,7 +121,7 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	// 1. 가스비 계산 및 누적
 	gas := jitGasTable[op]
 	// TODO: 0x5f condition is for hardfork-awareness.
-	if gas == 0 && op != 0x00 && op != 0x5f {
+	if gas == 0 && op != byte(STOP) && op != byte(PUSH0) {
 		// If the gas cost is 0 in the table but the opcode is not STOP (0x00),
 		// it may be an unsupported opcode with an undefined gas cost.
 		// To be safe, we abort JIT compilation in this case.
@@ -130,7 +130,7 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	}
 
 	// SHA3 (0x20) 추가 가스비 (Word Cost)
-	if op == 0x20 {
+	if op == byte(SHA3) {
 		if slot, exists := az.memSlot[az.pc]; exists && slot.isStatic {
 			// toWordSize: (len + 31) / 32
 			wordCount := toWordSize(slot.length)
@@ -169,8 +169,8 @@ func (az *traceAnalyzer) finalizeStep(op byte, info opInfo) bool {
 	instSize := uint64(1)
 	var pushData []byte
 
-	if info.isStaticPush && op != 0x5f { // PUSH1..32
-		dataLen := uint64(op - 0x60 + 1)
+	if info.isStaticPush && op != byte(PUSH0) { // PUSH1..32
+		dataLen := uint64(op - byte(PUSH1) + 1)
 		instSize += dataLen
 
 		// 데이터 읽기 (범위 체크)
@@ -202,7 +202,7 @@ func (az *traceAnalyzer) finishSegment() {
 
 func (az *traceAnalyzer) isLastOpPush() bool {
 	// PUSH0 or PUSH1-32
-	return az.lastOp == 0x5f || (az.lastOp >= 0x60 && az.lastOp <= 0x7f)
+	return az.lastOp == byte(PUSH0) || (az.lastOp >= byte(PUSH1) && az.lastOp <= byte(PUSH32))
 }
 
 func (az *traceAnalyzer) resetLastOp() {
@@ -249,42 +249,40 @@ func getOpInfo(op byte) opInfo {
 
 	switch {
 	// PUSH0 (Shanghai)
-	case op == 0x5f:
+	case op == byte(PUSH0):
 		return opInfo{0, 1, true, true}
 
 	// PUSH1 ~ PUSH32
-	case op >= 0x60 && op <= 0x7f:
+	case op >= byte(PUSH1) && op <= byte(PUSH32):
 		return opInfo{0, 1, true, true}
 
 	// --- Stack Operations ---
 
 	// DUP1 ~ DUP16
-	case op >= 0x80 && op <= 0x8f:
+	case op >= byte(DUP1) && op <= byte(DUP16):
 		return opInfo{0, 1, true, false}
 
 	// SWAP1 ~ SWAP16
-	case op >= 0x90 && op <= 0x9f:
+	case op >= byte(SWAP1) && op <= byte(SWAP16):
 		return opInfo{0, 0, true, false}
 
 	// POP
-	case op == 0x50:
+	case op == byte(POP):
 		return opInfo{1, 0, true, false}
 
 	// --- Arithmetic / Logic / Comparison ---
 	// 0x01~0x0b (Arith), 0x10~0x1d (Cmp/Bitwise)
-	case (op >= 0x01 && op <= 0x0b) || (op >= 0x10 && op <= 0x1d):
+	case (op >= byte(ADD) && op <= byte(SIGNEXTEND)) || (op >= byte(LT) && op <= byte(SAR)):
 		// No suupoort of `Exp` opcode due to the dynamic cost
-		if op == 0x0a {
+		if op == byte(EXP) {
 			return opInfo{isSupported: false}
 		}
 
-		// ISZERO(0x15), NOT(0x19)
-		if op == 0x15 || op == 0x19 {
+		if op == byte(ISZERO) || op == byte(NOT) {
 			return opInfo{1, 1, true, false}
 		}
 
-		// ADDMOD(0x08), MULMOD(0x09)
-		if op == 0x08 || op == 0x09 {
+		if op == byte(ADDMOD) || op == byte(MULMOD) {
 			return opInfo{3, 1, true, false}
 		}
 
@@ -292,45 +290,34 @@ func getOpInfo(op byte) opInfo {
 		// LT, GT, SLT, SGT, EQ, AND, OR, XOR, BYTE, SHL, SHR, SAR
 		return opInfo{2, 1, true, false}
 
-	case op == 0x20:
+	case op == byte(SHA3):
 		return opInfo{2, 1, true, false}
 
 	// ---  Environmental Information (CallData) ---
-	// CALLDATALOAD (0x35)
 	// Stack: Pop 1 (offset), Push 1 (data) -> Net 0
 	// Gas: 3 (VeryLow)
-	case op == 0x35:
+	case op == byte(CALLDATALOAD):
 		return opInfo{1, 1, true, false}
 
-	// CALLDATASIZE (0x36)
 	// Stack: Pop 0, Push 1 (size) -> Net +1
 	// Gas: 2 (Base)
-	case op == 0x36:
+	case op == byte(CALLDATASIZE):
 		return opInfo{0, 1, true, false}
 
-	// MEMORY
-	case op == 0x51: // MLOAD
+	case op == byte(MLOAD): // MLOAD
 		return opInfo{1, 1, true, false}
-	// MSTORE, MSTORE8
-	case op == 0x52 || op == 0x53:
+	case op == byte(MSTORE) || op == byte(MSTORE8):
 		return opInfo{2, 0, true, false}
 
 	// --- Flow Control ---
 
-	// PC
-	case op == 0x58:
+	case op == byte(PC):
 		return opInfo{0, 1, true, false}
-
-	// JUMPDEST
-	case op == 0x5b:
+	case op == byte(JUMPDEST):
 		return opInfo{0, 0, true, false}
-
-	// JUMP (Unconditional)
-	case op == 0x56:
+	case op == byte(JUMP):
 		return opInfo{1, 0, true, false}
-
-	// JUMPI (Conditional)
-	case op == 0x57:
+	case op == byte(JUMPI):
 		return opInfo{2, 0, true, false}
 
 	default:
@@ -342,115 +329,114 @@ func getOpInfo(op byte) opInfo {
 func getPhase1OpInfo(op byte) opInfo {
 	switch {
 	// --- 0x00: Stop & Arithmetic ---
-	case op == 0x00: // STOP
+	case op == byte(STOP): // STOP
 		return opInfo{0, 0, true, false}
-	case op >= 0x01 && op <= 0x0b: // ADD, MUL, SUB ...
-		if op == 0x08 || op == 0x09 { // ADDMOD, MULMOD
+	case op >= byte(ADD) && op <= byte(SIGNEXTEND): // ADD, MUL, SUB ...
+		if op == byte(ADDMOD) || op == byte(MULMOD) { // ADDMOD, MULMOD
 			return opInfo{3, 1, true, false}
 		}
 		return opInfo{2, 1, true, false} // ADD~SMOD, EXP, SIGNEXTEND
 
 	// --- 0x10: Comparison & Bitwise ---
-	case op >= 0x10 && op <= 0x1d:
-		if op == 0x15 || op == 0x19 { // ISZERO, NOT
+	case op >= byte(LT) && op <= byte(SAR):
+		if op == byte(ISZERO) || op == byte(NOT) {
 			return opInfo{1, 1, true, false}
 		}
 		return opInfo{2, 1, true, false} // LT~SAR
 
-	// --- 0x20: SHA3 ---
-	case op == 0x20:
+	case op == byte(SHA3):
 		return opInfo{2, 1, true, false}
 
 	// --- 0x30: Environmental Info ---
-	case op >= 0x30 && op <= 0x3f:
-		if op == 0x31 || op == 0x3b || op == 0x3f { // BALANCE, EXTCODESIZE, EXTCODEHASH
+	case op >= byte(ADDRESS) && op <= byte(EXTCODEHASH):
+		if op == byte(BALANCE) || op == byte(EXTCODESIZE) || op == byte(EXTCODEHASH) {
 			return opInfo{1, 1, true, false}
 		}
-		if op == 0x37 || op == 0x39 || op == 0x3e { // CALLDATACOPY, CODECOPY, RETURNDATACOPY
+		if op == byte(CALLDATACOPY) || op == byte(CODECOPY) || op == byte(RETURNDATACOPY) {
 			return opInfo{3, 0, true, false}
 		}
-		if op == 0x3c { // EXTCODECOPY
+		if op == byte(EXTCODECOPY) {
 			return opInfo{4, 0, true, false}
 		}
-		if op == 0x35 { // CALLDATALOAD
+		if op == byte(CALLDATALOAD) {
 			return opInfo{1, 1, true, false}
 		}
 		// ADDRESS, ORIGIN, CALLER, CALLVALUE, CALLDATASIZE, CODESIZE, GASPRICE, RETURNDATASIZE
 		return opInfo{0, 1, true, false}
 
 	// --- 0x40: Block Info ---
-	case op >= 0x40 && op <= 0x4a:
-		if op == 0x40 || op == 0x49 { // BLOCKHASH, BLOBHASH
+	case op >= byte(BLOCKHASH) && op <= byte(BLOBBASEFEE):
+		if op == byte(BLOCKHASH) || op == byte(BLOCKHASH) {
 			return opInfo{1, 1, true, false}
 		}
 		// COINBASE, TIMESTAMP, NUMBER, PREVRANDAO, GASLIMIT, CHAINID, SELFBALANCE, BASEFEE, BLOBBASEFEE
 		return opInfo{0, 1, true, false}
 
 	// --- 0x50: Stack & Memory & Flow ---
-	case op == 0x50: // POP
+	case op == byte(POP):
 		return opInfo{1, 0, true, false}
-	case op == 0x51: // MLOAD
+	case op == byte(MLOAD):
 		return opInfo{1, 1, true, false}
-	case op == 0x52 || op == 0x53: // MSTORE, MSTORE8
+	case op == byte(MSTORE) || op == byte(MSTORE8):
 		return opInfo{2, 0, true, false}
-	case op == 0x54: // SLOAD
+	case op == byte(SLOAD):
 		return opInfo{1, 1, true, false}
-	case op == 0x55: // SSTORE
+	case op == byte(SSTORE):
 		return opInfo{2, 0, true, false}
-	case op == 0x56: // JUMP
+	case op == byte(JUMP):
 		return opInfo{1, 0, true, false}
-	case op == 0x57: // JUMPI
+	case op == byte(JUMPI):
 		return opInfo{2, 0, true, false}
-	case op == 0x58: // PC
+	case op == byte(PC):
 		return opInfo{0, 1, true, false}
-	case op == 0x59: // MSIZE
+	case op == byte(MSIZE):
 		return opInfo{0, 1, true, false}
-	case op == 0x5a: // GAS
+	case op == byte(GAS):
 		return opInfo{0, 1, true, false}
-	case op == 0x5b: // JUMPDEST
+	case op == byte(JUMPDEST):
 		return opInfo{0, 0, true, false}
-	case op == 0x5c: // TLOAD (Cancun)
+	case op == byte(TLOAD):
 		return opInfo{1, 1, true, false}
-	case op == 0x5d: // TSTORE (Cancun)
+	case op == byte(TSTORE):
 		return opInfo{2, 0, true, false}
-	case op == 0x5e: // MCOPY (Cancun)
+	case op == byte(MCOPY):
 		return opInfo{3, 0, true, false}
-	case op == 0x5f: // PUSH0 (Shanghai)
+	case op == byte(PUSH0):
 		return opInfo{0, 1, true, true} // Static Push
 
 	// --- 0x60: PUSH ---
-	case op >= 0x60 && op <= 0x7f: // PUSH1 ~ PUSH32
+	case op >= byte(PUSH1) && op <= byte(PUSH32): // PUSH1 ~ PUSH32
 		return opInfo{0, 1, true, true} // Static Push
 
 	// --- 0x80: DUP ---
-	case op >= 0x80 && op <= 0x8f: // DUP1 ~ DUP16
+	case op >= byte(DUP1) && op <= byte(DUP16): // DUP1 ~ DUP16
 		return opInfo{0, 1, true, false}
 
 	// --- 0x90: SWAP ---
-	case op >= 0x90 && op <= 0x9f: // SWAP1 ~ SWAP16
+	case op >= byte(SWAP1) && op <= byte(SWAP16): // SWAP1 ~ SWAP16
 		return opInfo{0, 0, true, false}
 
 	// --- 0xA0: LOG ---
-	case op >= 0xa0 && op <= 0xa4: // LOG0 ~ LOG4
+	case op >= byte(LOG0) && op <= byte(LOG4): // LOG0 ~ LOG4
 		// LOGn pops 2 + n items
-		return opInfo{2 + int(op-0xa0), 0, true, false}
+		return opInfo{2 + int(op-byte(LOG0)), 0, true, false}
 
 	// --- 0xF0: System ---
-	case op == 0xf0: // CREATE
+	case op == byte(CREATE):
 		return opInfo{3, 1, true, false}
-	case op == 0xf1 || op == 0xf2: // CALL, CALLCODE
+	case op == byte(CALL) || op == byte(CALLCODE):
 		return opInfo{7, 1, true, false}
-	case op == 0xf3: // RETURN
+	case op == byte(RETURN):
 		return opInfo{2, 0, true, false}
-	case op == 0xf4 || op == 0xfa: // DELEGATECALL, STATICCALL
+	case op == byte(DELEGATECALL) || op == byte(STATICCALL):
 		return opInfo{6, 1, true, false}
-	case op == 0xf5: // CREATE2
+	case op == byte(CREATE2):
 		return opInfo{4, 1, true, false}
-	case op == 0xfd: // REVERT
+	case op == byte(REVERT):
 		return opInfo{2, 0, true, false}
 	case op == 0xfe: // INVALID
 		return opInfo{0, 0, false, false}
-	case op == 0xff: // SELFDESTRUCT
+	case op == byte(SELFDESTRUCT):
 		return opInfo{1, 0, true, false}
 
 	default:
@@ -518,10 +504,10 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		op := az.code[az.pc]
 
 		// ---------------------------------------------------------
-		// [1] JUMPDEST (0x5b) 처리
+		// [1] JUMPDEST
 		// ---------------------------------------------------------
 		// Superblock strategy: Continue tracing without breaking the block at JUMPDEST.
-		if op == 0x5b {
+		if op == byte(JUMPDEST) {
 			az.finishSegment() // Offset 조정을 위해 끊어줌
 			az.pc++            // JUMPDEST(1byte) 건너뛰기
 			az.segOffset = az.pc
@@ -532,15 +518,15 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 
 		info := getOpInfo(op)
 
-		if op == 0x51 || op == 0x52 || op == 0x53 || op == 0x20 {
+		if op == byte(MLOAD) || op == byte(MSTORE) || op == byte(MSTORE8) || op == byte(SHA3) {
 			memSlot := az.memSlot[az.pc]
 
 			if memSlot.isStatic {
 				var dataLen uint64
 				switch op {
-				case 0x51, 0x52: // MLOAD, MSTORE
+				case byte(MLOAD), byte(MSTORE):
 					dataLen = 32
-				case 0x53: // MSTORE8
+				case byte(MSTORE8):
 					dataLen = 1
 				}
 
@@ -554,7 +540,6 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 						info.isSupported = false
 					} else {
 						if memorySize > az.maxMemoryOff {
-							// TODO: Runtime JIT에서 0x20 (SHA3) 핸들링할때 `memory.GetPtr()`가 하는것처럼 range 체크필요
 							az.maxMemoryOff = memorySize
 						}
 					}
@@ -573,7 +558,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		// Add the Next PC to the worklist to allow for future JIT compilation.
 		if !info.isSupported {
 			az.saveSegment(az.pc)
-			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
+			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == byte(JUMPDEST) {
 				az.addToWorklist(az.pc + 2)
 			} else {
 				az.addToWorklist(az.pc + 1)
@@ -584,7 +569,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		// ---------------------------------------------------------
 		// [3] JUMP (Unconditional)
 		// ---------------------------------------------------------
-		if op == 0x56 {
+		if op == byte(JUMP) {
 			// Check static Jump (Opcode fusion)
 			dest, isStatic := az.checkStaticJump()
 
@@ -597,10 +582,10 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				}
 
 				// Gas consumption and remove opcode (Opcode Fusion)
-				az.totalGas += jitGasTable[0x56]
+				az.totalGas += jitGasTable[byte(JUMP)]
 				az.currentRelDepth -= 1
 
-				if az.lastOp >= 0x60 && az.lastOp <= 0x7f {
+				if az.lastOp >= byte(PUSH1) && az.lastOp <= byte(PUSH32) {
 					az.segLen -= az.lastInstSize
 				} else {
 					az.segLen += 1
@@ -610,7 +595,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				if az.visited[dest] {
 					az.saveSegment(dest)
 				} else {
-					if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
+					if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == byte(JUMPDEST) {
 						az.addToWorklist(az.pc + 2)
 					} else {
 						az.addToWorklist(az.pc + 1)
@@ -629,7 +614,7 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 				az.saveSegment(az.pc)
 
 				// Fall-through: add the next PC to the worklist to allow entry from other paths.
-				if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
+				if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == byte(JUMPDEST) {
 					az.addToWorklist(az.pc + 2)
 				} else {
 					az.addToWorklist(az.pc + 1)
@@ -641,12 +626,12 @@ func (az *traceAnalyzer) analyzeSuperBlock(startPC uint64) {
 		// ---------------------------------------------------------
 		// [4] JUMPI (Conditional)
 		// ---------------------------------------------------------
-		if op == 0x57 {
+		if op == byte(JUMPI) {
 			// JUMPI is a control flow branch; terminating the trace.
 			az.saveSegment(az.pc)
 
 			// Fall-through: false path
-			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == 0x5b {
+			if az.pc+1 < uint64(len(az.code)) && az.code[az.pc+1] == byte(JUMPDEST) {
 				az.addToWorklist(az.pc + 2)
 			} else {
 				az.addToWorklist(az.pc + 1)
@@ -742,8 +727,8 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				break
 			}
 			instSize := uint64(1)
-			if op >= 0x60 && op <= 0x7f {
-				instSize += uint64(op - 0x60 + 1)
+			if op >= byte(PUSH1) && op <= byte(PUSH32) {
+				instSize += uint64(op - byte(PUSH1) + 1)
 			}
 
 			// Stack Underflow Check
@@ -790,25 +775,25 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 			// TODO: Support more opcodes to wide the possible range of statically calculatable memory values
 			switch {
 			// --- Arithmetic (Binary) ---
-			case op == 0x01: // ADD
+			case op == byte(ADD):
 				binaryFunc(Add)
-			case op == 0x02: // MUL
+			case op == byte(MUL):
 				binaryFunc(Mul)
-			case op == 0x03: // SUB
+			case op == byte(SUB):
 				binaryFunc(Sub)
-			case op == 0x04: // DIV
+			case op == byte(DIV):
 				binaryFunc(Div)
-			case op == 0x05: // SDIV [New]
+			case op == byte(SDIV):
 				binaryFunc(SDiv)
-			case op == 0x06: // MOD
+			case op == byte(MOD):
 				binaryFunc(Mod)
-			case op == 0x07: // SMOD [New]
+			case op == byte(SMOD):
 				binaryFunc(SMod)
-			case op == 0x08: // ADDMOD [New - Ternary]
+			case op == byte(ADDMOD):
 				ternaryFunc(AddMod)
-			case op == 0x09: // MULMOD [New - Ternary]
+			case op == byte(MULMOD):
 				ternaryFunc(MulMod)
-			case op == 0x0B: // SIGNEXTEND [New]
+			case op == byte(SIGNEXTEND):
 				// SIGNEXTEND(b, x): Stack Top(b), Second(x)
 				// binaryFunc는 Top(s1), Second(s2)를 꺼내서 fn(s1, s2)를 호출함.
 				// EVM 스펙상 순서는 Stack[0]=b, Stack[1]=x.
@@ -816,41 +801,41 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				binaryFunc(SignExtend)
 
 			// --- Comparison (Binary) ---
-			case op == 0x10: // LT
+			case op == byte(LT):
 				binaryFunc(Lt)
-			case op == 0x11: // GT
+			case op == byte(GT):
 				binaryFunc(Gt)
-			case op == 0x12: // SLT [New]
+			case op == byte(SLT):
 				binaryFunc(Slt)
-			case op == 0x13: // SGT [New]
+			case op == byte(SGT):
 				binaryFunc(Sgt)
-			case op == 0x14: // EQ
+			case op == byte(EQ):
 				binaryFunc(Eq)
-			case op == 0x15: // ISZERO (Unary)
+			case op == byte(ISZERO):
 				unaryFunc(IsZero)
 
 			// --- Bitwise (Binary/Unary) ---
-			case op == 0x16: // AND
+			case op == byte(AND):
 				binaryFunc(And)
-			case op == 0x17: // OR
+			case op == byte(OR):
 				binaryFunc(Or)
-			case op == 0x18: // XOR
+			case op == byte(XOR):
 				binaryFunc(Xor)
-			case op == 0x19: // NOT (Unary)
+			case op == byte(NOT):
 				unaryFunc(Not)
-			case op == 0x1A: // BYTE [Updated: Unary]
+			case op == byte(BYTE): // BYTE [Updated: Unary]
 				// 님 요청대로 Unary Operation으로 처리
 				// Stack: [..., value] -> [..., byte(value)]
 				unaryFunc(Byte)
-			case op == 0x1B: // SHL
+			case op == byte(SHL):
 				binaryFunc(Shl)
-			case op == 0x1C: // SHR
+			case op == byte(SHR):
 				binaryFunc(Shr)
-			case op == 0x1D: // SAR
+			case op == byte(SAR):
 				binaryFunc(Sar)
 
 			// MLOAD
-			case op == 0x51:
+			case op == byte(MLOAD):
 				off := stack[len(stack)-1]
 				stack[len(stack)-1] = analysisSlot{isStatic: false} // pre-assigment. will be updated if possible
 				if off.isStatic {
@@ -869,7 +854,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				}
 
 			// MSTORE, MSTORE8
-			case op == 0x52 || op == 0x53:
+			case op == byte(MSTORE) || op == byte(MSTORE8):
 				off := stack[len(stack)-1]
 				val := stack[len(stack)-2]
 				stack = stack[:len(stack)-2]
@@ -878,7 +863,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 						valStore = val.val.Clone()
 						dataLen  uint64
 					)
-					if op == 0x52 { // MSTORE
+					if op == byte(MSTORE) { // MSTORE
 						dataLen = 32
 					} else { // MSTORE8
 						dataLen = 1
@@ -895,7 +880,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 
 			// [수정] SHA3 (0x20) - 가스비 계산용 Offset/Length 추적에만 집중
 			// 메모리 내용(Value) 복원은 포기하고 결과는 항상 Dynamic으로 처리
-			case op == 0x20:
+			case op == byte(SHA3):
 				size := stack[len(stack)-2]
 				offset := stack[len(stack)-1]
 				stack = stack[:len(stack)-2] // Pop 2
@@ -990,7 +975,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 			// 	// 6. 결과 스택에 Push
 			// 	stack = append(stack, analysisSlot{isStatic: isStatic, val: hashResult})
 
-			case op == 0x56: // JUMP
+			case op == byte(JUMP):
 				target := stack[len(stack)-1]
 				nextStack := stack[:len(stack)-1]
 				if _, exist := jumpSrcs[pc]; !exist {
@@ -1014,7 +999,7 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				isLastOpPush = false
 				goto StopBlock
 
-			case op == 0x57: // JUMPI
+			case op == byte(JUMPI):
 				target := stack[len(stack)-1]
 				nextStack := stack[:len(stack)-2] // Pop 2
 
@@ -1035,8 +1020,8 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				isLastOpPush = false
 				goto StopBlock
 
-			case op >= 0x80 && op <= 0x8f: // DUP
-				n := int(op - 0x80 + 1)
+			case op >= byte(DUP1) && op <= byte(DUP16):
+				n := int(op - byte(DUP1) + 1)
 				if len(stack) < n {
 					panic("TODO: Remove me 2")
 					goto StopBlock
@@ -1044,8 +1029,8 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				stack = append(stack, stack[len(stack)-n])
 				isLastOpPush = false
 
-			case op >= 0x90 && op <= 0x9f: // SWAP
-				n := int(op - 0x90 + 1)
+			case op >= byte(SWAP1) && op <= byte(SWAP16):
+				n := int(op - byte(SWAP1) + 1)
 				if len(stack) < n+1 {
 					panic("TODO: Remove me 3")
 					goto StopBlock
@@ -1055,18 +1040,18 @@ func (az *traceAnalyzer) runPhase1(startPC uint64) error {
 				stack[topIdx], stack[swapIdx] = stack[swapIdx], stack[topIdx]
 				isLastOpPush = false
 
-			case op >= 0x60 && op <= 0x7f: // PUSH
+			case op >= byte(PUSH1) && op <= byte(PUSH32): // PUSH
 				data := az.code[pc+1 : pc+instSize]
 				// slot := analysisSlot{isStatic: true, val: new(big.Int).SetBytes(data)}
 				slot := analysisSlot{isStatic: true, val: new(uint256.Int).SetBytes(data)}
 				stack = append(stack, slot)
 				isLastOpPush = true
 
-			case op == 0x5f: // PUSH0
+			case op == byte(PUSH0): // PUSH0
 				isLastOpPush = false
 				stack = append(stack, analysisSlot{isStatic: true, val: nil})
 
-			case op == 0x00 || op == 0xf3 || op == 0xfd: // STOP, RETURN, REVERT
+			case op == byte(STOP) || op == byte(RETURN) || op == byte(REVERT):
 				isLastOpPush = false
 				goto StopBlock
 
@@ -1097,8 +1082,8 @@ func (az *traceAnalyzer) addToWorklist(pc uint64) {
 	for pc < uint64(len(az.code)) {
 		op := az.code[pc]
 
-		if op >= 0x60 && op <= 0x7f {
-			dataLen := uint64(op - 0x60 + 1)
+		if op >= byte(PUSH1) && op <= byte(PUSH32) {
+			dataLen := uint64(op - byte(PUSH1) + 1)
 			nextPC := pc + 1 + dataLen
 			if nextPC >= uint64(len(az.code)) {
 				pc = nextPC
@@ -1127,7 +1112,7 @@ func (az *traceAnalyzer) checkStaticJump() (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	if dest >= uint64(len(az.code)) || az.code[dest] != 0x5b {
+	if dest >= uint64(len(az.code)) || az.code[dest] != byte(JUMPDEST) {
 		return 0, false
 	}
 	return dest, true

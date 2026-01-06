@@ -1,5 +1,6 @@
 use crate::engine::JitEngine;
 use crate::inline::InlineOps;
+use crate::opcode;
 use cranelift::{codegen::verify_function, prelude::*};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -103,16 +104,14 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
                 // [Inline] Arithmetic (ADD, SUB) -> i64 x 4
                 // -------------------------------------------------------------
-                0x01 => {
-                    // ADD
+                opcode::ADD => {
                     let top = load_i64_x4(&mut builder, offset - 32);
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let res = InlineOps::u256_add(&mut builder, top, second);
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
-                0x03 => {
-                    // SUB (EVM: a - b, stack: [a, b(top)])
+                opcode::SUB => {
                     let top = load_i64_x4(&mut builder, offset - 32);
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let res = InlineOps::u256_sub(&mut builder, top, second);
@@ -123,15 +122,14 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
                 // [Inline] Bitwise (AND, OR, XOR, NOT) -> i128 x 2
                 // -------------------------------------------------------------
-                0x16 | 0x17 | 0x18 => {
-                    // AND, OR, XOR (Commutative)
+                opcode::AND | opcode::OR | opcode::XOR => {
                     let second = load_i128_x2(&mut builder, offset - 64);
                     let top = load_i128_x2(&mut builder, offset - 32);
 
                     let op_func = match op {
-                        0x16 => |b: &mut FunctionBuilder, x, y| b.ins().band(x, y),
-                        0x17 => |b: &mut FunctionBuilder, x, y| b.ins().bor(x, y),
-                        0x18 => |b: &mut FunctionBuilder, x, y| b.ins().bxor(x, y),
+                        opcode::AND => |b: &mut FunctionBuilder, x, y| b.ins().band(x, y),
+                        opcode::OR => |b: &mut FunctionBuilder, x, y| b.ins().bor(x, y),
+                        opcode::XOR => |b: &mut FunctionBuilder, x, y| b.ins().bxor(x, y),
                         _ => unreachable!(),
                     };
 
@@ -139,8 +137,7 @@ pub extern "C" fn compile_trace(
                     store_i128_x2(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
-                0x19 => {
-                    // NOT (Unary)
+                opcode::NOT => {
                     let top = load_i128_x2(&mut builder, offset - 32);
                     let res = InlineOps::u256_not_128(&mut builder, top);
                     store_i128_x2(&mut builder, offset - 32, res); // In-place
@@ -149,54 +146,42 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
                 // [Inline] Comparison
                 // -------------------------------------------------------------
-                0x10 => {
-                    // LT (Top < Second)
+                opcode::LT => {
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let top = load_i64_x4(&mut builder, offset - 32);
-
                     let res =
                         InlineOps::u256_cmp(&mut builder, top, second, IntCC::UnsignedLessThan);
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                0x11 => {
-                    // GT (Top > Second)
+                opcode::GT => {
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let top = load_i64_x4(&mut builder, offset - 32);
-
-                    // [수정] Top > Second
                     let res =
                         InlineOps::u256_cmp(&mut builder, top, second, IntCC::UnsignedGreaterThan);
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                0x12 => {
-                    // SLT (Top < Second Signed)
+                opcode::SLT => {
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let top = load_i64_x4(&mut builder, offset - 32);
-
-                    // [수정] Top < Second (Signed)
                     let res = InlineOps::u256_cmp(&mut builder, top, second, IntCC::SignedLessThan);
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                0x13 => {
-                    // SGT (Top > Second Signed)
+                opcode::SGT => {
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let top = load_i64_x4(&mut builder, offset - 32);
-
-                    // [수정] Top > Second (Signed)
                     let res =
                         InlineOps::u256_cmp(&mut builder, top, second, IntCC::SignedGreaterThan);
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                0x14 => {
-                    // EQ (Commutative)
+                opcode::EQ => {
                     let second = load_i64_x4(&mut builder, offset - 64);
                     let top = load_i64_x4(&mut builder, offset - 32);
                     let res = InlineOps::u256_eq(&mut builder, top, second);
@@ -204,14 +189,13 @@ pub extern "C" fn compile_trace(
                     offset -= 32;
                 }
 
-                0x15 => {
-                    // ISZERO
+                opcode::ISZERO => {
                     let a = load_i64_x4(&mut builder, offset - 32);
                     let res = InlineOps::u256_iszero(&mut builder, a);
                     store_i64_x4(&mut builder, offset - 32, res);
                 }
 
-                0x20 => {
+                opcode::SHA3 => {
                     let fid = get_runtime_func(module, funcs, "jit_sha3", 3);
                     let ptr_size_dest = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
                     let ptr_offset = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
@@ -222,38 +206,26 @@ pub extern "C" fn compile_trace(
                     offset -= 32;
                 }
 
-                // SHL (0x1b)
-                0x1b => {
+                opcode::SHL => {
                     let val = load_i64_x4(&mut builder, offset - 64); // Stack[Top-1] (Value)
                     let shift = load_i64_x4(&mut builder, offset - 32); // Stack[Top] (Shift)
-
-                    // EVM: SHL(shift, value)
                     let res = InlineOps::u256_shl(&mut builder, shift, val);
-
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                // SHR (0x1c)
-                0x1c => {
+                opcode::SHR => {
                     let val = load_i64_x4(&mut builder, offset - 64);
                     let shift = load_i64_x4(&mut builder, offset - 32);
-
-                    // EVM: SHR(shift, value)
                     let res = InlineOps::u256_shr(&mut builder, shift, val);
-
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
 
-                // SAR (0x1d)
-                0x1d => {
+                opcode::SAR => {
                     let val = load_i64_x4(&mut builder, offset - 64);
                     let shift = load_i64_x4(&mut builder, offset - 32);
-
-                    // EVM: SAR(shift, value)
                     let res = InlineOps::u256_sar(&mut builder, shift, val);
-
                     store_i64_x4(&mut builder, offset - 64, res);
                     offset -= 32;
                 }
@@ -262,18 +234,22 @@ pub extern "C" fn compile_trace(
                 // [Host Call] Complex Ops (DIV, MOD, EXP, etc)
                 // -------------------------------------------------------------
                 // Binary Ops
-                0x02 | 0x04..=0x07 | 0x0a | 0x0b | 0x1a..=0x1d => {
+                opcode::MUL
+                | opcode::DIV
+                | opcode::SDIV
+                | opcode::MOD
+                | opcode::SMOD
+                | opcode::SIGNEXTEND
+                | opcode::BYTE => {
+                    // 0x02 | 0x04..=0x07 | 0x0a | 0x0b | 0x1a..=0x1d => {
                     let func_name = match op {
-                        0x02 => "jit_mul",
-                        0x04 => "jit_div",
-                        0x05 => "jit_sdiv",
-                        0x06 => "jit_mod",
-                        0x07 => "jit_smod",
-                        0x0b => "jit_signextend",
-                        0x1a => "jit_byte",
-                        // 0x1b => "jit_shl",
-                        // 0x1c => "jit_shr",
-                        // 0x1d => "jit_sar",
+                        opcode::MUL => "jit_mul",
+                        opcode::DIV => "jit_div",
+                        opcode::SDIV => "jit_sdiv",
+                        opcode::MOD => "jit_mod",
+                        opcode::SMOD => "jit_smod",
+                        opcode::SIGNEXTEND => "jit_signextend",
+                        opcode::BYTE => "jit_byte",
                         _ => unreachable!(),
                     };
 
@@ -290,8 +266,8 @@ pub extern "C" fn compile_trace(
                 }
 
                 // Ternary Ops
-                0x08 | 0x09 => {
-                    let func_name = if op == 0x08 {
+                opcode::ADDMOD | opcode::MULMOD => {
+                    let func_name = if op == opcode::ADDMOD {
                         "jit_addmod"
                     } else {
                         "jit_mulmod"
@@ -311,19 +287,7 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
                 // [Environment Operations]
                 // -------------------------------------------------------------
-
-                // CALLDATALOAD (0x35)
-                // 0x35 => {
-                //     let fid = get_runtime_func(module, funcs, "jit_calldataload", 3);
-                //     let func_ref = module.declare_func_in_func(fid, builder.func);
-                //     let ptr_top = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
-                //     builder
-                //         .ins()
-                //         .call(func_ref, &[ptr_top, input_ptr, input_len]);
-                // }
-
-                // CALLDATALOAD (0x35) [Stability Fix: Revert to I64 to prevent Alignment Crash]
-                0x35 => {
+                opcode::CALLDATALOAD => {
                     let ptr_top = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
                     // [중요] unaligned 접근을 명시하지만, I128은 CPU 레벨에서 터질 수 있어 I64가 안전함
                     let mem = MemFlags::new();
@@ -479,8 +443,7 @@ pub extern "C" fn compile_trace(
                     builder.seal_block(block_done);
                 }
 
-                // CALLDATASIZE (0x36)
-                0x36 => {
+                opcode::CALLDATASIZE => {
                     // Stack: Push 1 (input_len)
                     let ptr = builder.ins().iadd_imm(stack_cursor, offset as i64);
                     let mem = MemFlags::new();
@@ -501,29 +464,19 @@ pub extern "C" fn compile_trace(
                 // -------------------------------------------------------------
                 // [Stack Operations]
                 // -------------------------------------------------------------
-
-                // POP
-                0x50 => {
+                opcode::POP => {
                     offset -= 32;
                 }
 
-                // MLOAD
-                0x51 => {
-                    // Stack: [..., offset] -> [..., value]
-
+                opcode::MLOAD => {
                     let mem = MemFlags::new();
-
-                    // 1. 오프셋 가져오기
                     let offset_ptr = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
                     let mem_offset = builder.ins().load(types::I64, mem, offset_ptr, 0);
-
-                    // 2. 메모리 주소 계산
                     let src_ptr = builder.ins().iadd(memory_ptr, mem_offset);
 
                     // 3. [최적화] 128비트 단위로 로드 (2번만 수행)
                     // EVM Memory (Big Endian): [High 128bit (MSB)] [Low 128bit (LSB)]
                     // Stack (Little Endian):   [Low 128bit (LSB)]  [High 128bit (MSB)]
-
                     // (1) High Part (MSB): Memory + 0  -> Stack + 16
                     // load.i128은 x86에서 XMM 레지스터를 사용 (SSE/AVX)
                     let val_msb_be = builder.ins().load(types::I128, mem, src_ptr, 0);
@@ -536,20 +489,14 @@ pub extern "C" fn compile_trace(
                     builder.ins().store(mem, val_lsb, offset_ptr, 0);
                 }
 
-                // MSTORE
-                0x52 => {
-                    // Stack: [..., value, offset]
-
+                opcode::MSTORE => {
                     let mem = MemFlags::new();
-
                     let off_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
                     let val_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
-
                     let mem_offset = builder.ins().load(types::I64, mem, off_ptr_stack, 0);
                     let dst_ptr = builder.ins().iadd(memory_ptr, mem_offset);
 
                     // [최적화] Stack(Little) -> Bswap -> Memory(Big)
-
                     // (1) High Part: Stack + 16 -> Memory + 0
                     let val_msb = builder.ins().load(types::I128, mem, val_ptr_stack, 16);
                     let val_msb_be = builder.ins().bswap(val_msb);
@@ -563,8 +510,7 @@ pub extern "C" fn compile_trace(
                     offset -= 64; // Pop 2
                 }
 
-                // MSTORE8
-                0x53 => {
+                opcode::MSTORE8 => {
                     let mem = MemFlags::new();
                     let off_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 32) as i64);
                     let val_ptr_stack = builder.ins().iadd_imm(stack_cursor, (offset - 64) as i64);
@@ -577,9 +523,7 @@ pub extern "C" fn compile_trace(
                     offset -= 64; // Pop 2
                 }
 
-                // MSIZE
-                0x59 => {
-                    // Stack: [] -> [size] (Push 1)
+                opcode::MSIZE => {
                     let ptr = builder.ins().iadd_imm(stack_cursor, offset as i64);
                     let mem = MemFlags::new();
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -597,8 +541,7 @@ pub extern "C" fn compile_trace(
                     offset += 32;
                 }
 
-                // PUSH0
-                0x5f => {
+                opcode::PUSH0 => {
                     let ptr = builder.ins().iadd_imm(stack_cursor, offset as i64);
                     let zero = builder.ins().iconst(types::I128, 0); // Use i128 for speed
                     let mem = MemFlags::new();
@@ -608,7 +551,7 @@ pub extern "C" fn compile_trace(
                 }
 
                 // PUSH1..32
-                op if (0x60..=0x7f).contains(&op) => {
+                op if (opcode::PUSH1..=opcode::PUSH32).contains(&op) => {
                     let size = (op - 0x60 + 1) as usize;
                     let mut buf = [0u8; 32];
                     if cursor + size <= bytecode.len() {
@@ -667,8 +610,7 @@ pub extern "C" fn compile_trace(
                     offset += 32;
                 }
 
-                // DUP (i128 x 2)
-                op if (0x80..=0x8f).contains(&op) => {
+                op if (opcode::DUP1..=opcode::DUP16).contains(&op) => {
                     let depth = (op - 0x80 + 1) as i32;
                     let src_off = offset - (depth * 32);
 
@@ -683,8 +625,7 @@ pub extern "C" fn compile_trace(
                     offset += 32;
                 }
 
-                // SWAP (i128 x 2)
-                op if (0x90..=0x9f).contains(&op) => {
+                op if (opcode::SWAP1..=opcode::SWAP16).contains(&op) => {
                     let depth = (op - 0x90 + 1) as i32;
                     let off1 = offset - 32;
                     let off2 = offset - ((depth + 1) * 32);
@@ -704,8 +645,7 @@ pub extern "C" fn compile_trace(
                     builder.ins().store(mem, v1_hi, ptr2, 16);
                 }
 
-                // PC (0x58)
-                0x58 => {
+                opcode::PC => {
                     let pc_val = current_real_pc;
                     let ptr = builder.ins().iadd_imm(stack_cursor, offset as i64);
                     let v_pc = builder.ins().iconst(types::I64, pc_val as i64);
@@ -719,13 +659,11 @@ pub extern "C" fn compile_trace(
                     offset += 32;
                 }
 
-                // Flow (JUMP, JUMPI - Handled by Go)
-                0x56 => {
+                opcode::JUMP => {
                     // NOTE: if analyzer determines that dynamic jump is allowed, then this `pop`
                     // behavior is required to make a stack be consistent
                     offset -= 32;
                 }
-                // 0x5b => {}
                 _ => {
                     unimplemented!("{}", format!("unimplemented opcode: {:x}", op));
                 }
