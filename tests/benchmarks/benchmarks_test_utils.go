@@ -71,7 +71,7 @@ func makeBenchConfig() *BenchConfig {
 	return cfg
 }
 
-func prepareInterpreterAndContract(code []byte) (*vm.EVMInterpreter, *vm.Contract) {
+func prepareInterpreterAndContract(code []byte, contractAddr common.Address, compCost uint64) (*vm.EVMInterpreter, *vm.Contract) {
 	// runtime.go:Execute()
 	cfg := makeBenchConfig()
 	cfg.Origin = common.HexToAddress("0x123")
@@ -89,9 +89,15 @@ func prepareInterpreterAndContract(code []byte) (*vm.EVMInterpreter, *vm.Contrac
 		BlockScore:  cfg.BlockScore,
 		GasLimit:    cfg.GasLimit,
 	}
+	if compCost != 0 {
+		cfg.EVMConfig.ComputationCostLimit = compCost
+	}
 	evm := vm.NewEVM(blockContext, txContext, cfg.State, cfg.ChainConfig, &cfg.EVMConfig)
 
 	address := common.BytesToAddress([]byte("contract"))
+	if contractAddr != (common.Address{}) {
+		address = contractAddr
+	}
 	sender := vm.AccountRef(cfg.Origin)
 
 	cfg.State.CreateSmartContractAccount(address, params.CodeFormatEVM, cfg.ChainConfig.Rules(cfg.BlockNumber))
