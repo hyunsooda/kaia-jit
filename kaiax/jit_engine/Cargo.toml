@@ -8,11 +8,11 @@ crate-type = ["staticlib"]
 
 #TODO: Bump up the Cranelift version to latest version
 [dependencies]
-cranelift = "0.108.0"
-cranelift-jit = "0.108.0"
-cranelift-module = "0.108.0"
+cranelift = "0.127.1"
+cranelift-jit = "0.127.1"
+cranelift-module = "0.127.1"
 target-lexicon = "0.12.0"
-cranelift-native = "0.108.0"
+cranelift-native = "0.127.1"
 ethnum = "1.5.2"
 capstone = "0.13.0"
 tiny-keccak = {version = "2.0.2", features = ["keccak"]}

@@ -1,6 +1,7 @@
 use crate::engine::JitEngine;
 use crate::inline::InlineOps;
 use crate::opcode;
+use cranelift::codegen::ir::BlockArg;
 use cranelift::{codegen::verify_function, prelude::*};
 use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -396,7 +397,8 @@ pub extern "C" fn compile_trace(
                     let loop_exit = builder.create_block();
 
                     let idx_init = builder.ins().iconst(types::I64, 0);
-                    builder.ins().jump(loop_header, &[idx_init]);
+                    let idx_init_arg = BlockArg::from(idx_init);
+                    builder.ins().jump(loop_header, &[idx_init_arg]);
 
                     // Loop Header
                     builder.switch_to_block(loop_header);
@@ -423,7 +425,8 @@ pub extern "C" fn compile_trace(
                     builder.ins().store(mem, byte_val, dst_ptr, 0);
 
                     let idx_next = builder.ins().iadd_imm(idx, 1);
-                    builder.ins().jump(loop_header, &[idx_next]);
+                    let idx_next_arg = BlockArg::from(idx_next);
+                    builder.ins().jump(loop_header, &[idx_next_arg]);
 
                     // Loop Exit
                     builder.switch_to_block(loop_exit);
