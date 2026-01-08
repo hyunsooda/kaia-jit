@@ -127,7 +127,7 @@ func doInstall(cmdline []string) {
 	)
 	flag.CommandLine.Parse(cmdline)
 	env := build.Env()
-
+	build.MustRun(build.CompileJIT())
 	var tagsArgs []string
 	if len(*tags) > 0 {
 		tagsArgs = append(tagsArgs, "-tags", *tags)
@@ -380,7 +380,6 @@ func doLint(cmdline []string, exitOnError bool) {
 		fname = "linter_report.txt"
 	)
 	flag.CommandLine.Parse(cmdline)
-
 	packages := []string{"./..."}
 	if len(flag.CommandLine.Args()) > 0 {
 		packages = flag.CommandLine.Args()

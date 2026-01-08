@@ -42,6 +42,14 @@ import (
 
 var DryRunFlag = flag.Bool("n", false, "dry run, don't execute commands")
 
+func CompileJIT() *exec.Cmd {
+	cmd := exec.Command("cargo", "build", "--release")
+	cmd.Dir = "kaiax/jit_engine"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
 // TryRun executes the given command and returns an error if error occurs.
 func TryRun(cmd *exec.Cmd) error {
 	fmt.Println(">>>", strings.Join(cmd.Args, " "))
