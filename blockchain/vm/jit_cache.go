@@ -48,12 +48,13 @@ const JIT_FLAG = byte(0xEE)
 var (
 	jitCache             = make(map[jitCacheKey]*jitCacheValue)
 	jitCompiledContracts = make(map[common.Address][]byte)
+	jitOriginContracts   = make(map[common.Address][]byte)
 	analyzedContracts    = make(map[common.Hash]bool)
 	cacheLock            sync.RWMutex
 )
 
 // PrepareJIT analyze the given contract source code compile and cache it if possible
-func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
+func (in *EVMInterpreter) PrepareJit(contract *Contract) (bool, error) {
 	codeHash := contract.CodeHash
 
 	// 1. Fast Check: check if the contract has been analyzed
@@ -61,23 +62,23 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 	analyzed := analyzedContracts[codeHash]
 	cacheLock.RUnlock()
 	if analyzed {
-		return nil
+		return false, nil
 	}
 
 	// 2. Analysis: Find compilable code blocks
 	batchResults, err := AnalyzeTrace(contract.Code, 0)
 	if err != nil {
-		return err
+		return false, err
 	}
 	analyzedContracts[codeHash] = true
 	if len(batchResults) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// 3. Initialize JIT engine if not intialized before
 	in.initJitEngine()
 	if in.jitEngine == nil {
-		return errors.New("JIT engine is not initialized")
+		return false, errors.New("JIT engine is not initialized")
 	}
 
 	// 4. Compile the analyzed code blocks which are legal to compile
@@ -125,10 +126,10 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 		if cErrMsg != nil {
 			goMsg := C.GoString(cErrMsg)
 			C.free_error_msg(cErrMsg)
-			return errors.New(fmt.Sprintf("JIT compilation error: %s", goMsg))
+			return false, errors.New(fmt.Sprintf("JIT compilation error: %s", goMsg))
 		}
 		if rawPtr == nil {
-			return errors.New("JIT compilation failed with unknown error")
+			return false, errors.New("JIT compilation failed with unknown error")
 		}
 
 		// Cache the compiled code into the cache
@@ -152,8 +153,10 @@ func (in *EVMInterpreter) PrepareJit(contract *Contract) error {
 		jitCompiledContracts[*contract.CodeAddr] = compiledCode
 		// fmt.Printf("### %x %x (%x)\n", startPC, trace.NextPC, trace.MaxMemoryOff)
 	}
-
-	return nil
+	if jitCompiledContracts[*contract.CodeAddr] != nil {
+		jitOriginContracts[*contract.CodeAddr] = contract.Code
+	}
+	return true, nil
 }
 
 func (in *EVMInterpreter) GetCachedJit(contract *Contract, pc uint64) *jitCacheValue {

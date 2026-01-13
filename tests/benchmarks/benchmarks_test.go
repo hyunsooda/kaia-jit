@@ -63,7 +63,8 @@ func TestFiboOrigin(t *testing.T) {
 
 func TestFiboJIT(t *testing.T) {
 	input := common.Hex2Bytes("6b370a4c0000000000000000000000000000000000000000000000000000000000000170")
-	assert.Nil(t, fiboIntrp.PrepareJit(fiboContract))
+	_, err := fiboIntrp.PrepareJit(fiboContract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(fiboContract)
 	for range 10 {
 		tt := time.Now()
@@ -93,7 +94,8 @@ func TestCalcOrigin(t *testing.T) {
 func TestCalcJIT(t *testing.T) {
 	// addInput := common.Hex2Bytes("771602f7000000000000000000000000000000000000000000000000000000000000012c0000000000000000000000000000000000000000000000000000000000000069")
 	subInput := common.Hex2Bytes("b67d77c5000000000000000000000000000000000000000000000000000000000000012c0000000000000000000000000000000000000000000000000000000000000069")
-	assert.Nil(t, calcIntrp.PrepareJit(calcContract))
+	_, err := calcIntrp.PrepareJit(calcContract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(calcContract)
 	for range 1 {
 		tt := time.Now()
@@ -110,7 +112,8 @@ func TestCalcJIT(t *testing.T) {
 
 func TestCalcMerge(t *testing.T) {
 	input := common.Hex2Bytes("7f98a45e0000000000000000000000000000000000000000000000000000000000000150")
-	assert.Nil(t, mergeIntrp.PrepareJit(mergeContract))
+	_, err := mergeIntrp.PrepareJit(mergeContract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(mergeContract)
 	for range 1 {
 		tt := time.Now()
@@ -125,7 +128,8 @@ func TestWKAIAJIT(t *testing.T) {
 	a, err := wkaiaIntrp.Run(wkaiaContract, faucetInput)
 	fmt.Println(a, err)
 
-	assert.Nil(t, wkaiaIntrp.PrepareJit(wkaiaContract))
+	_, err = wkaiaIntrp.PrepareJit(wkaiaContract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(wkaiaContract)
 
 	transferInput := common.Hex2Bytes("a9059cbb00000000000000000000000000000000000000000000000000000000000004560000000000000000000000000000000000000000000000000000000000000064")
@@ -198,7 +202,9 @@ func TestERC20JIT(t *testing.T) {
 	// input = common.Hex2Bytes("70a082310000000000000000000000000000000000000000000000000000000000000123")
 	// a, err = intrp.Run(contract, input)
 	// vm.PrintPC()
-	assert.Nil(t, erc20Intrp.PrepareJit(erco20Contract))
+
+	_, err = erc20Intrp.PrepareJit(erco20Contract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(erco20Contract)
 	// input = common.Hex2Bytes("70a082310000000000000000000000000000000000000000000000000000000000000123")
 	input = common.Hex2Bytes("a9059cbb00000000000000000000000000000000000000000000000000000000000004560000000000000000000000000000000000000000000000000000000000000064")
@@ -217,11 +223,12 @@ func TestERC20JIT(t *testing.T) {
 }
 
 func TestCounterJIT(t *testing.T) {
-	assert.Nil(t, counterIntrp.PrepareJit(counterContract))
+	_, err := counterIntrp.PrepareJit(counterContract)
+	assert.Nil(t, err)
 	vm.ReplaceWithJitTransformation(counterContract)
 
 	inc := common.Hex2Bytes("d09de08a")
-	_, err := counterIntrp.Run(counterContract, inc)
+	_, err = counterIntrp.Run(counterContract, inc)
 	assert.Nil(t, err)
 
 	count := common.Hex2Bytes("06661abd")
@@ -244,7 +251,7 @@ func TestCounterOrigin(t *testing.T) {
 }
 
 func BenchmarkCounterJIT(b *testing.B) {
-	err := counterIntrp.PrepareJit(counterContract)
+	_, err := counterIntrp.PrepareJit(counterContract)
 	if err != nil {
 		b.Fatalf("execution failed: %v", err)
 	}
@@ -273,7 +280,7 @@ func BenchmarkCounterOrigin(b *testing.B) {
 }
 
 func BenchmarkCalcJIT(b *testing.B) {
-	err := calcIntrp.PrepareJit(calcContract)
+	_, err := calcIntrp.PrepareJit(calcContract)
 	if err != nil {
 		b.Fatalf("JIT prepration failed: %v", err)
 	}
@@ -310,7 +317,7 @@ func BenchmarkERC20JIT(b *testing.B) {
 		b.Fatalf("execution failed: %v", err)
 	}
 
-	err = erc20Intrp.PrepareJit(erco20Contract)
+	_, err = erc20Intrp.PrepareJit(erco20Contract)
 	if err != nil {
 		b.Fatalf("JIT prepration failed: %v", err)
 	}
@@ -346,7 +353,7 @@ func BenchmarkERC20Origin(b *testing.B) {
 
 func BenchmarkFiboJIT(b *testing.B) {
 	input := common.Hex2Bytes("6b370a4c0000000000000000000000000000000000000000000000000000000000000170")
-	err := fiboIntrp.PrepareJit(fiboContract)
+	_, err := fiboIntrp.PrepareJit(fiboContract)
 	if err != nil {
 		b.Fatalf("JIT prepration failed: %v", err)
 	}
@@ -400,7 +407,7 @@ func BenchmarkWKAIAJIT(b *testing.B) {
 		b.Fatalf("execution failed: %v", err)
 	}
 
-	err = wkaiaIntrp.PrepareJit(wkaiaContract)
+	_, err = wkaiaIntrp.PrepareJit(wkaiaContract)
 	if err != nil {
 		b.Fatalf("JIT prepration failed: %v", err)
 	}

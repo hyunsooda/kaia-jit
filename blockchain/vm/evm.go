@@ -94,13 +94,14 @@ func run(evm *EVM, contract *Contract, input []byte) ([]byte, error) {
 			return ret, err
 		}
 	}
-	// if *contract.CodeAddr == common.HexToAddress("0x786b81Eb450A26E8c3df0104478BA172f77003D1") {
-	// 	fmt.Println("@@@", hexutil.Encode(input))
-	// 	// evm.interpreter.PrepareJit(contract)
-	// 	// ReplaceWithJitTransformation(contract)
-	// 	// fmt.Println("REPLACED")
-	// }
-	// fmt.Println("START")
+	contractAddr := contract.Address()
+	if (contractAddr != common.HexToAddress("0x0000000000000000000000000000000000000400")) &&
+		(contractAddr != common.HexToAddress("0x0000000000000000000000000000000000000401")) &&
+		(contractAddr != common.HexToAddress("0x0000000000000000000000000000000000000402")) {
+		if initialCompile, err := evm.interpreter.PrepareJit(contract); err == nil && initialCompile {
+			ReplaceWithJitTransformation(contract)
+		}
+	}
 	return evm.interpreter.Run(contract, input)
 }
 

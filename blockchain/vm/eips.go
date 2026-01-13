@@ -276,6 +276,9 @@ func opJit(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte
 	if jitExecuted {
 		// fmt.Printf("JITEXECUTED: %x %x\n", *pc, nextPC)
 		*pc = nextPC - 1
+	} else {
+		// restore origin opcode
+		scope.Contract.Code[*pc] = jitOriginContracts[scope.Contract.Address()][*pc]
 	}
 	return nil, nil
 }
